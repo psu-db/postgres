@@ -159,10 +159,8 @@ mock_deparse_relation_ref(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	relname = RelationGetRelationName(table);
 
 	/*
-	 * Coordinator tables are named like pg1_lineitem, pg2_orders, etc.
-	 * Keep that exact relation name when deparsing to a destination where
-	 * that source is local (public.pgN_table). For non-destination sources,
-	 * emit remote.pgN_table.
+	 * if source is local (public.pgN_table). For non-destination sources,
+	 * remote.pgN_table.
 	 */
 	remote_relname = relname;
 	remote_nspname = nspname;
@@ -397,7 +395,7 @@ mock_append_target_list(StringInfo buf, PlannerInfo *root, List *exprs,
 	}
 
 	if (first)
-		appendStringInfoString(buf, "NULL");
+		appendStringInfoString(buf, "*");
 }
 
 static void
@@ -697,7 +695,7 @@ mock_deparse_base_sql_for_source(PlannerInfo *root,
 	if (!*supported)
 	{
 		/*
-		 * Fallback to wildcard projection if target expression deparse is not
+		 * Fallback to * projection if target expression deparse is not
 		 * supported for this baserel.
 		 */
 		resetStringInfo(&buf);

@@ -15,6 +15,7 @@
 #include "parser/parse_relation.h"
 #include "commands/explain.h"
 #include "executor/executor.h"
+#include "utils/ruleutils.h"
 
 #include <string.h>
 
@@ -29,6 +30,7 @@ static set_join_pathlist_hook_type prev_set_join_pathlist_hook = NULL;
 static CustomPathMethods exchange_path_methods;
 
 static bool is_remote_table(Oid relid);
+static int fqp_dest_rti_from_custom_private(List *custom_private);
 
 static RangeTblEntry *
 fqp_rt_fetch(PlannerInfo *root, Index rti)
@@ -49,6 +51,13 @@ typedef struct FqpSourceCandidate
     char   *source;
     int		rti;
 } FqpSourceCandidate;
+
+typedef struct FqpRelSiteInfo
+{
+    int     dest_rti;
+    char    source[64];
+    bool    has_remote_site;
+} FqpRelSiteInfo;
 
 static bool
 fqp_parse_source_from_relname(const char *relname, char *source, int source_sz)
@@ -136,6 +145,123 @@ fqp_collect_remote_sources(PlannerInfo *root, Relids relids)
     return sources;
 }
 
+static bool
+fqp_get_source_for_rti(PlannerInfo *root, Index rti, char *source, int source_sz)
+{
+    if (root == NULL || source == NULL || source_sz <= 1 || rti <= 0)
+        return false;
+
+    return fqp_get_source_for_rte(fqp_rt_fetch(root, rti), source, source_sz);
+}
+
+static bool
+fqp_get_source_for_rel(PlannerInfo *root, RelOptInfo *rel, FqpRelSiteInfo *site)
+{
+    if (site == NULL)
+        return false;
+
+    site->dest_rti = 0;
+    site->source[0] = '\0';
+    site->has_remote_site = false;
+
+    if (root == NULL || rel == NULL)
+        return false;
+
+    if (IS_SIMPLE_REL(rel))
+    {
+        if (fqp_get_source_for_rti(root, rel->relid, site->source, sizeof(site->source)))
+        {
+            site->dest_rti = (int) rel->relid;
+            site->has_remote_site = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    if (rel->reloptkind == RELOPT_JOINREL &&
+        rel->cheapest_total_path != NULL &&
+        rel->cheapest_total_path->pathtype == T_CustomScan)
+    {
+        CustomPath *cp = (CustomPath *) rel->cheapest_total_path;
+
+        site->dest_rti = fqp_dest_rti_from_custom_private(cp->custom_private);
+        if (site->dest_rti <= 0)
+            return false;
+
+        if (fqp_get_source_for_rti(root, (Index) site->dest_rti, site->source, sizeof(site->source)))
+        {
+            site->has_remote_site = true;
+            return true;
+        }
+
+        site->dest_rti = 0;
+    }
+
+    return false;
+}
+
+static bool
+fqp_candidate_source_exists(PlannerInfo *root, int *candidate_dests, int candidate_count, const char *source)
+{
+    int i;
+
+    if (root == NULL || candidate_dests == NULL || source == NULL || source[0] == '\0')
+        return false;
+
+    for (i = 0; i < candidate_count; i++)
+    {
+        int existing_dest_rti;
+        char existing_source[64];
+
+        existing_dest_rti = candidate_dests[i];
+        if (existing_dest_rti <= 0)
+            continue;
+
+        existing_source[0] = '\0';
+        if (!fqp_get_source_for_rti(root, (Index) existing_dest_rti, existing_source, sizeof(existing_source)))
+            continue;
+
+        if (strcmp(existing_source, source) == 0)
+            return true;
+    }
+
+    return false;
+}
+
+static bool
+fqp_requires_data_movement(bool rel_remote,
+                           const FqpRelSiteInfo *rel_site,
+                           int candidate_dest_rti,
+                           const char *candidate_source)
+{
+    if (!rel_remote)
+        return (candidate_dest_rti != 0);
+
+    if (candidate_dest_rti == 0)
+        return true;
+
+    if (rel_site == NULL || rel_site->source[0] == '\0')
+        return true;
+
+    if (candidate_source == NULL || candidate_source[0] == '\0')
+        return true;
+
+    return strcmp(rel_site->source, candidate_source) != 0;
+}
+
+static Cost
+fqp_data_movement_cost(Cardinality rows, int width)
+{
+    double factor;
+
+    if (rows <= 0 || width <= 0)
+        return 0.0;
+
+    factor = mock_table_data_movement_factor();
+    return (Cost) (factor * (double) rows * (double) width);
+}
+
 static bool is_remote_table(Oid relid) {
     Oid namespaceId = get_rel_namespace(relid);
     char *schemaName = get_namespace_name(namespaceId);
@@ -209,24 +335,104 @@ static void
 explain_exchange_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 {
     CustomScan  *cscan;
+    const char  *scan_kind;
     int          dest_rti;
     int          remote_expr_count;
+    int          remote_projection_count;
     bool         has_local_qual;
+    bool         has_dest_source;
+    char         dest_source[64];
+    RangeTblEntry *dest_rte;
     const char  *dest_text;
+    List        *dpcontext;
+    bool         useprefix;
+    List        *remote_filters;
+    List        *remote_projections;
+    ListCell    *lc;
 
     cscan = (CustomScan *) node->ss.ps.plan;
+    scan_kind = (cscan->scan.scanrelid != 0) ? "baserel" : "joinrel";
     dest_rti = fqp_dest_rti_from_custom_private(cscan->custom_private);
-    remote_expr_count = list_length(cscan->custom_exprs);
+    remote_expr_count = 0;
+    remote_projection_count = 0;
     has_local_qual = (cscan->scan.plan.qual != NIL);
+    has_dest_source = false;
+    dest_source[0] = '\0';
+    remote_filters = NIL;
+    remote_projections = NIL;
+    dpcontext = set_deparse_context_plan(es->deparse_cxt, node->ss.ps.plan, ancestors);
+    useprefix = true;//(es->rtable_size > 1 || es->verbose);
+
+    foreach(lc, cscan->custom_exprs)
+    {
+        Node *expr = (Node *) lfirst(lc);
+
+        if (expr != NULL)
+            remote_filters = lappend(remote_filters,
+                                     deparse_expression(expr, dpcontext, useprefix, false));
+    }
+
+    if (cscan->custom_private != NIL && list_length(cscan->custom_private) > 1)
+    {
+        List *restrictlist = (List *) lsecond(cscan->custom_private);
+
+        if (restrictlist != NIL)
+        {
+            List *actual_clauses = get_actual_clauses(restrictlist);
+
+            foreach(lc, actual_clauses)
+            {
+                Node *expr = (Node *) lfirst(lc);
+
+                if (expr != NULL)
+                    remote_filters = lappend(remote_filters,
+                                             deparse_expression(expr, dpcontext, useprefix, false));
+            }
+        }
+    }
+
+    foreach(lc, cscan->custom_scan_tlist)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+        if (tle != NULL && !tle->resjunk)
+            remote_projections = lappend(remote_projections,
+                                         deparse_expression((Node *) tle->expr,
+                                                            dpcontext,
+                                                            useprefix,
+                                                            false));
+    }
+
+    remote_expr_count = list_length(remote_filters);
+    remote_projection_count = list_length(remote_projections);
+
+    dest_rte = NULL;
+    if (dest_rti > 0 &&
+        node->ss.ps.state != NULL &&
+        node->ss.ps.state->es_range_table != NIL &&
+        dest_rti <= list_length(node->ss.ps.state->es_range_table))
+    {
+        dest_rte = rt_fetch((Index) dest_rti, node->ss.ps.state->es_range_table);
+        has_dest_source = fqp_get_source_for_rte(dest_rte, dest_source, sizeof(dest_source));
+    }
 
     if (dest_rti == 0)
         dest_text = "local";
+    else if (has_dest_source)
+        dest_text = psprintf("remote (source=%s)", dest_source);
     else
-        dest_text = psprintf("remote (table_rti=%d)", dest_rti);
+        dest_text = "remote (source=unknown)";
 
     ExplainPropertyText("FQP Annotation", dest_text, es);
-    ExplainPropertyInteger("FQP Annotation RTI", NULL, dest_rti, es);
+    ExplainPropertyText("FQP Scan Kind", scan_kind, es);
+    // ExplainPropertyText("FQP Annotation Source", has_dest_source ? dest_source : (dest_rti == 0 ? "local" : "unknown"), es);
+    // ExplainPropertyInteger("FQP Annotation RTI", NULL, dest_rti, es);
     ExplainPropertyInteger("FQP Remote Expr Count", NULL, remote_expr_count, es);
+    ExplainPropertyInteger("FQP Remote Projection Count", NULL, remote_projection_count, es);
+    if (remote_filters != NIL)
+        ExplainPropertyList("FQP Remote Filters", remote_filters, es);
+    if (remote_projections != NIL)
+        ExplainPropertyList("FQP Remote Projections", remote_projections, es);
     ExplainPropertyBool("FQP Local Qual Present", has_local_qual, es);
 }
 
@@ -321,7 +527,8 @@ fqp_log_remote_base_explain(RangeTblEntry *rte, Index rti)
          quote_identifier(relname));
 }
 
-static void fqp_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte) {
+static void 
+fqp_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte) {
     CustomPath *cpath;
     char source[64];
 
@@ -382,7 +589,7 @@ static void fqp_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index 
 
             if (got_remote_cost)
             {
-                elog(LOG, "mock_table remote explain (baserel rti=%d): %s", (int) rti, sql);
+                // elog(LOG, "mock_table remote explain (baserel rti=%d): %s", (int) rti, sql);
                 elog(LOG,
                      "mock_table remote parsed base cost used (rti=%d source=%s): startup=%.3f total=%.3f rows=%.0f width=%d",
                      (int) rti,
@@ -421,7 +628,8 @@ static void fqp_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index 
     }
 }
 
-static void fqp_get_relation_info_hook(PlannerInfo *root, Oid relOid, bool inhparent, RelOptInfo *rel) {
+static void 
+fqp_get_relation_info_hook(PlannerInfo *root, Oid relOid, bool inhparent, RelOptInfo *rel) {
     bool supported;
     bool got_remote_cost;
     char *sql;
@@ -580,10 +788,6 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
         return;
     }
     
-    // Both are remote
-    
-    // joinrel->pathlist = NIL;
-    // joinrel->partial_pathlist = NIL;
 
     cpath = makeNode(CustomPath);
     cpath->path.pathtype = T_CustomScan;
@@ -603,11 +807,47 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     best_width = plan_width;
     dest_rti = outerRel;
     got_remote_cost = false;
-    sources = fqp_collect_remote_sources(root, joinrel->relids);
+    sources = NIL;
+    source_count = 0;
+
+    if (outerRel > 0)
+    {
+        char outer_source[64];
+
+        if (fqp_get_source_for_rti(root, (Index) outerRel, outer_source, sizeof(outer_source)))
+        {
+            FqpSourceCandidate *cand = (FqpSourceCandidate *) palloc(sizeof(FqpSourceCandidate));
+
+            cand->source = pstrdup(outer_source);
+            cand->rti = outerRel;
+            sources = lappend(sources, cand);
+        }
+    }
+
+    if (innerRel > 0)
+    {
+        char inner_source[64];
+
+        if (fqp_get_source_for_rti(root, (Index) innerRel, inner_source, sizeof(inner_source)) &&
+            !fqp_source_exists(sources, inner_source))
+        {
+            FqpSourceCandidate *cand = (FqpSourceCandidate *) palloc(sizeof(FqpSourceCandidate));
+
+            cand->source = pstrdup(inner_source);
+            cand->rti = innerRel;
+            sources = lappend(sources, cand);
+        }
+    }
+
     source_count = list_length(sources);
+
+    // elog(LOG,
+    //      "mock_table: joinrel candidate source scope restricted to annotated outer/inner rels (count=%d)",
+    //      source_count);
 
     if (supported)
     {
+        // children have different annotations
         if (source_count > 1)
         {
             bool have_candidate = false;
@@ -677,6 +917,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
             plan_rows = best_rows;
             plan_width = best_width;
         }
+        // children have same annotation
         else if (source_count == 1)
         {
             FqpSourceCandidate *cand = (FqpSourceCandidate *) linitial(sources);
@@ -752,10 +993,6 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     cpath->methods = &exchange_path_methods;
 
     add_path(joinrel, (Path *) cpath);
-
-    // set to cheapest path
-    // joinrel->cheapest_total_path = (Path *) cpath;
-    // joinrel->cheapest_startup_path = (Path *) cpath;
 
     elog(LOG, "mock_table: added remote-remote custom join path for joinrel");
     if (supported && !got_remote_cost)
