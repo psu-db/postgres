@@ -745,6 +745,123 @@ reloptinfo_dest_rti(PlannerInfo *root, RelOptInfo *rel)
     return 0;
 }
 
+static bool
+fqp_is_final_joinrel(PlannerInfo *root, RelOptInfo *joinrel)
+{
+    int member = -1;
+
+    if (root == NULL || joinrel == NULL)
+        return false;
+
+    if (joinrel->relids == NULL || root->all_baserels == NULL)
+        return false;
+
+    /* * Fast path: If the bitmaps match directly, it's definitively the final joinrel.
+     * This handles queries that don't involve mixed-schema table mappings.
+     */
+    if (bms_is_subset(root->all_baserels, joinrel->relids))
+    {
+        elog(LOG, "fqp_is_final_joinrel: Fast path hit. root->all_baserels is subset of joinrel->relids.");
+        return true;
+    }
+
+    elog(LOG, "fqp_is_final_joinrel: Fast path failed. Falling back to schema-agnostic name matching.");
+
+    /* * Federated Schema-Agnostic Path: 
+     * Check if every base relation in the query root has a corresponding relation 
+     * with the same base table name in the joinrel, ignoring the schema.
+     */
+    while ((member = bms_next_member(root->all_baserels, member)) >= 0)
+    {
+        RangeTblEntry *rte_root = fqp_rt_fetch(root, (Index) member);
+        char *root_relname;
+        bool found_match = false;
+        int join_member = -1;
+
+        /* Only process actual relations */
+        if (rte_root == NULL || rte_root->rtekind != RTE_RELATION)
+            continue;
+
+        root_relname = get_rel_name(rte_root->relid);
+        if (root_relname == NULL)
+            continue;
+
+        elog(LOG, "fqp_is_final_joinrel: Checking root RTI %d (table: %s)", member, root_relname);
+
+        /* Search the joinrel for a table with the identical unqualified name */
+        while ((join_member = bms_next_member(joinrel->relids, join_member)) >= 0)
+        {
+            RangeTblEntry *rte_join = fqp_rt_fetch(root, (Index) join_member);
+            char *join_relname;
+
+            if (rte_join == NULL || rte_join->rtekind != RTE_RELATION)
+                continue;
+
+            join_relname = get_rel_name(rte_join->relid);
+            if (join_relname == NULL)
+                continue;
+
+            elog(LOG, "fqp_is_final_joinrel:   Comparing against joinrel RTI %d (table: %s)", join_member, join_relname);
+
+            if (strcmp(root_relname, join_relname) == 0)
+            {
+                elog(LOG, "fqp_is_final_joinrel:   -> Match found! (root RTI %d == joinrel RTI %d by name %s)", member, join_member, root_relname);
+                found_match = true;
+                break; /* Move on to the next root relation */
+            }
+        }
+
+        /* * If we found a table in the query root that is NOT represented 
+         * by name in this joinrel, it is not the final join.
+         */
+        if (!found_match)
+        {
+            elog(LOG, "fqp_is_final_joinrel: Root table %s (RTI %d) NOT found in joinrel. Returning false.", root_relname, member);
+            return false;
+        }
+    }
+
+    elog(LOG, "fqp_is_final_joinrel: All root relations found in joinrel by name. Returning true.");
+    return true;
+}
+
+static bool
+fqp_should_skip_remote_probe(PlannerInfo *root, RelOptInfo *joinrel, const char *candidate_source)
+{
+    const char *request_source;
+
+    if (!fqp_is_final_joinrel(root, joinrel))
+        return false;
+
+    if (candidate_source == NULL || candidate_source[0] == '\0')
+        return false;
+
+    request_source = mock_table_request_source_id();
+
+    elog(LOG, "Request and candidate sources: %s vs %s", request_source, candidate_source);
+
+    if (request_source == NULL || request_source[0] == '\0')
+        return false;
+
+    return strcmp(request_source, candidate_source) == 0;
+}
+
+static bool
+fqp_is_local_candidate_source(const char *candidate_source)
+{
+    const char *local_source;
+
+    if (candidate_source == NULL || candidate_source[0] == '\0')
+        return false;
+
+    local_source = mock_table_local_source_id();
+    elog(LOG, "Local and candidate sources: %s vs %s", local_source, candidate_source);
+    if (local_source == NULL || local_source[0] == '\0')
+        return false;
+
+    return strcmp(local_source, candidate_source) == 0;
+}
+
 static void
 fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel, JoinType jointype, JoinPathExtraData *extra)
 {
@@ -782,7 +899,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
 
     if ((outerRel != 0 && innerRel == 0) || (outerRel == 0 && innerRel != 0)) {
         elog(LOG,
-             "mock_table: joinrel mixed local-remote (outer_dest_rti=%d inner_dest_rti=%d), keeping core planner join paths; no cascade remote EXPLAIN in this branch",
+             "mock_table: joinrel mixed local-remote (outer_dest_rti=%d inner_dest_rti=%d), evaluating remote probe candidate",
              outerRel,
              innerRel);
         return;

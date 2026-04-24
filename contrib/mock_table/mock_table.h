@@ -24,6 +24,9 @@ extern const char *mock_table_remote_schema_name(void);
 
 extern double mock_table_data_movement_factor(void);
 
+extern const char *mock_table_request_source_id(void);
+extern const char *mock_table_local_source_id(void);
+
 extern bool mock_remote_explain_sql(const char *sql,
 							Cost *startup_cost,
 							Cost *total_cost,
