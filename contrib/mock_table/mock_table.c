@@ -1091,7 +1091,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
              (double) plan_rows,
              plan_width);
 
-    if (!(supported && source_count > 1 && got_remote_cost))
+    if (!(supported && source_count >= 1 && got_remote_cost))
     {
         movement_factor = mock_table_data_movement_factor();
         data_movement_cost = (plan_rows > 0) ? (Cost) (movement_factor * (double) plan_rows) : 0.0;
