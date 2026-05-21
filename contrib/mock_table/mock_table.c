@@ -18,6 +18,7 @@
 #include "utils/ruleutils.h"
 
 #include <string.h>
+#include <float.h>
 
 #include "mock_table.h"
 
@@ -879,7 +880,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
         return; // both local, do nothing
     }
 
-    if (fqp_is_final_joinrel(root, joinrel)) {
+    if (fqp_is_final_joinrel(root, joinrel)) { // final sink, no changes
         elog(LOG, "mock_table: final joinrel detected, keeping core planner join paths");
         return;
     }
@@ -914,8 +915,8 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     sql = NULL;
     supported = true;
 
-    startup_cost = 2.0;
-    total_cost = 50.0;
+    startup_cost = DBL_MAX;
+    total_cost = DBL_MAX;
     plan_rows = joinrel->rows;
     plan_width = joinrel->reltarget->width;
     best_startup_cost = startup_cost;
@@ -964,7 +965,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
 
     if (supported)
     {
-        // children have different annotations
+        // children have different remote annotations 
         if (source_count > 1)
         {
             bool have_candidate = false;
@@ -1052,7 +1053,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
             plan_rows = best_rows;
             plan_width = best_width;
         }
-        // children have same annotation
+        // children have atleast one remote annotation
         else if (source_count == 1)
         {
             FqpSourceCandidate *cand = (FqpSourceCandidate *) linitial(sources);
@@ -1130,7 +1131,8 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     if (supported && source_count >= 1 && got_remote_cost)
     {
         movement_factor = mock_table_data_movement_factor();
-        data_movement_cost = (plan_rows > 0) ? (Cost) (movement_factor * (double) plan_rows) : 0.0;
+        data_movement_cost = (plan_rows > 0) ? (Cost) (movement_factor * (double) plan_rows * (double) plan_width) : 0.0;
+        // data_movement_cost = (plan_rows > 0) ? (Cost) (movement_factor * (double) plan_rows) : 0.0;
         total_cost += data_movement_cost;
     }
 
