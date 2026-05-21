@@ -23,6 +23,8 @@
 
 PG_MODULE_MAGIC;
 
+// #define FQP_MAX_LOCAL_ROWS_FOR_REMOTE_PROBE 10000.0
+
 static get_relation_info_hook_type prev_get_rel_info_hook = NULL;
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 static set_join_pathlist_hook_type prev_set_join_pathlist_hook = NULL;
@@ -826,27 +828,6 @@ fqp_is_final_joinrel(PlannerInfo *root, RelOptInfo *joinrel)
 }
 
 static bool
-fqp_should_skip_remote_probe(PlannerInfo *root, RelOptInfo *joinrel, const char *candidate_source)
-{
-    const char *request_source;
-
-    if (!fqp_is_final_joinrel(root, joinrel))
-        return false;
-
-    if (candidate_source == NULL || candidate_source[0] == '\0')
-        return false;
-
-    request_source = mock_table_request_source_id();
-
-    elog(LOG, "Request and candidate sources: %s vs %s", request_source, candidate_source);
-
-    if (request_source == NULL || request_source[0] == '\0')
-        return false;
-
-    return strcmp(request_source, candidate_source) == 0;
-}
-
-static bool
 fqp_is_local_candidate_source(const char *candidate_source)
 {
     const char *local_source;
@@ -883,6 +864,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     int best_width;
     int dest_rti;
     int source_count;
+    bool is_mixed_local_remote;
     List *sources;
     ListCell *lc;
 
@@ -897,13 +879,31 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
         return; // both local, do nothing
     }
 
-    if ((outerRel != 0 && innerRel == 0) || (outerRel == 0 && innerRel != 0)) {
-        elog(LOG,
-             "mock_table: joinrel mixed local-remote (outer_dest_rti=%d inner_dest_rti=%d), evaluating remote probe candidate",
-             outerRel,
-             innerRel);
+    if (fqp_is_final_joinrel(root, joinrel)) {
+        elog(LOG, "mock_table: final joinrel detected, keeping core planner join paths");
         return;
     }
+
+    is_mixed_local_remote = ((outerRel != 0 && innerRel == 0) ||
+                             (outerRel == 0 && innerRel != 0));
+
+    // if (is_mixed_local_remote) {
+    //     double local_rows;
+
+    //     elog(LOG,
+    //          "mock_table: joinrel mixed local-remote (outer_dest_rti=%d inner_dest_rti=%d), evaluating remote probe candidate",
+    //          outerRel,
+    //          innerRel);
+
+    //     local_rows = (outerRel == 0) ? outerrel->rows : innerrel->rows;
+    //     if (local_rows > FQP_MAX_LOCAL_ROWS_FOR_REMOTE_PROBE)
+    //     {
+    //         elog(LOG,
+    //              "mock_table: local relation too large (%.0f rows) to push to remote, skipping remote EXPLAIN",
+    //              local_rows);
+    //         return;
+    //     }
+    // }
     
 
     cpath = makeNode(CustomPath);
@@ -922,7 +922,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     best_total_cost = total_cost;
     best_rows = plan_rows;
     best_width = plan_width;
-    dest_rti = outerRel;
+    dest_rti = (outerRel != 0) ? outerRel : innerRel;
     got_remote_cost = false;
     sources = NIL;
     source_count = 0;
@@ -968,6 +968,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
         if (source_count > 1)
         {
             bool have_candidate = false;
+            bool saw_nonlocal_candidate = false;
 
             foreach(lc, sources)
             {
@@ -982,6 +983,16 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                 cand_total = total_cost;
                 cand_rows = plan_rows;
                 cand_width = plan_width;
+
+                if (fqp_is_local_candidate_source(cand->source))
+                {
+                    elog(LOG,
+                         "mock_table: skipping self-source join probe candidate (source=%s)",
+                         cand->source);
+                    continue;
+                }
+
+                saw_nonlocal_candidate = true;
 
                 sql = mock_deparse_join_sql_for_source(root,
                                                        joinrel,
@@ -1028,6 +1039,13 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                 }
             }
 
+            if (!saw_nonlocal_candidate)
+            {
+                elog(LOG,
+                     "mock_table: all join probe candidates are local/self; keeping core planner join paths");
+                return;
+            }
+
             got_remote_cost = have_candidate;
             startup_cost = best_startup_cost;
             total_cost = best_total_cost;
@@ -1038,6 +1056,14 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
         else if (source_count == 1)
         {
             FqpSourceCandidate *cand = (FqpSourceCandidate *) linitial(sources);
+
+            if (fqp_is_local_candidate_source(cand->source))
+            {
+                elog(LOG,
+                     "mock_table: only join probe candidate is local/self (source=%s); keeping core planner join paths",
+                     cand->source);
+                return;
+            }
 
             sql = mock_deparse_join_sql_for_source(root,
                                                    joinrel,
@@ -1062,24 +1088,34 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
         }
         else
         {
-            sql = mock_deparse_join_sql(root,
-                                        joinrel,
-                                        outerrel,
-                                        innerrel,
-                                        jointype,
-                                        (extra != NULL) ? extra->restrictlist : NIL,
-                                        &supported);
-
-            if (supported)
-                elog(LOG, "mock_table remote explain (join): EXPLAIN %s", sql);
+            if (is_mixed_local_remote)
+            {
+                elog(LOG,
+                     "mock_table: mixed local-remote join has no remote source candidate; skipping generic remote EXPLAIN fallback (outer_dest_rti=%d inner_dest_rti=%d)",
+                     outerRel,
+                     innerRel);
+            }
             else
-                elog(LOG, "mock_table remote explain (join): deparse unsupported");
+            {
+                sql = mock_deparse_join_sql(root,
+                                            joinrel,
+                                            outerrel,
+                                            innerrel,
+                                            jointype,
+                                            (extra != NULL) ? extra->restrictlist : NIL,
+                                            &supported);
 
-            got_remote_cost = mock_remote_explain_sql(sql,
-                                                      &startup_cost,
-                                                      &total_cost,
-                                                      &plan_rows,
-                                                      &plan_width);
+                if (supported)
+                    elog(LOG, "mock_table remote explain (join): EXPLAIN %s", sql);
+                else
+                    elog(LOG, "mock_table remote explain (join): deparse unsupported");
+
+                got_remote_cost = mock_remote_explain_sql(sql,
+                                                          &startup_cost,
+                                                          &total_cost,
+                                                          &plan_rows,
+                                                          &plan_width);
+            }
         }
     }
 
@@ -1091,13 +1127,32 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
              (double) plan_rows,
              plan_width);
 
-    if (!(supported && source_count >= 1 && got_remote_cost))
+    if (supported && source_count >= 1 && got_remote_cost)
     {
         movement_factor = mock_table_data_movement_factor();
         data_movement_cost = (plan_rows > 0) ? (Cost) (movement_factor * (double) plan_rows) : 0.0;
         total_cost += data_movement_cost;
     }
 
+    // {
+    //     Cost child_startup = 0.0;
+    //     Cost child_total = 0.0;
+
+    //     if (outerrel != NULL && outerrel->cheapest_total_path != NULL)
+    //     {
+    //         child_startup += outerrel->cheapest_total_path->startup_cost;
+    //         child_total += outerrel->cheapest_total_path->total_cost;
+    //     }
+
+    //     if (innerrel != NULL && innerrel->cheapest_total_path != NULL)
+    //     {
+    //         child_startup += innerrel->cheapest_total_path->startup_cost;
+    //         child_total += innerrel->cheapest_total_path->total_cost;
+    //     }
+
+    //     cpath->path.startup_cost = startup_cost + child_startup;
+    //     cpath->path.total_cost = total_cost + child_total;
+    // }
     cpath->path.startup_cost = startup_cost;
     cpath->path.total_cost = total_cost;
     cpath->path.rows = plan_rows;

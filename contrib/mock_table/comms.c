@@ -22,7 +22,7 @@ static double mock_data_movement_factor = 0.01;
 static bool mock_use_interface_transport = true;
 static char *mock_interface_host = NULL;
 static int mock_interface_http_base_port = 15433;
-static int mock_interface_timeout_ms = 10000;
+static int mock_interface_timeout_ms = 20000;
 static char *mock_source_id = NULL;
 static char *mock_request_source_id = NULL;
 
@@ -260,7 +260,7 @@ mock_table_define_comms_gucs(void)
 						"Timeout for fqp_db_interface EXPLAIN HTTP requests (ms).",
 						NULL,
 						&mock_interface_timeout_ms,
-						2000,
+						20000,
 						1,
 						60000,
 						PGC_USERSET,
