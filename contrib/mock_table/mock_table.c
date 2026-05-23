@@ -24,8 +24,6 @@
 
 PG_MODULE_MAGIC;
 
-// #define FQP_MAX_LOCAL_ROWS_FOR_REMOTE_PROBE 10000.0
-
 static get_relation_info_hook_type prev_get_rel_info_hook = NULL;
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 static set_join_pathlist_hook_type prev_set_join_pathlist_hook = NULL;
@@ -54,13 +52,6 @@ typedef struct FqpSourceCandidate
     char   *source;
     int		rti;
 } FqpSourceCandidate;
-
-typedef struct FqpRelSiteInfo
-{
-    int     dest_rti;
-    char    source[64];
-    bool    has_remote_site;
-} FqpRelSiteInfo;
 
 static bool
 fqp_parse_source_from_relname(const char *relname, char *source, int source_sz)
@@ -118,36 +109,6 @@ fqp_source_exists(List *sources, const char *source)
     return false;
 }
 
-static List *
-fqp_collect_remote_sources(PlannerInfo *root, Relids relids)
-{
-    List   *sources = NIL;
-    int		 member = -1;
-
-    while ((member = bms_next_member(relids, member)) >= 0)
-    {
-        Index			 rti;
-        RangeTblEntry *rte;
-        char		 source[64];
-        FqpSourceCandidate *cand;
-
-        rti = (Index) member;
-        rte = fqp_rt_fetch(root, rti);
-        if (!fqp_get_source_for_rte(rte, source, sizeof(source)))
-            continue;
-
-        if (fqp_source_exists(sources, source))
-            continue;
-
-        cand = (FqpSourceCandidate *) palloc(sizeof(FqpSourceCandidate));
-        cand->source = pstrdup(source);
-        cand->rti = (int) rti;
-        sources = lappend(sources, cand);
-    }
-
-    return sources;
-}
-
 static bool
 fqp_get_source_for_rti(PlannerInfo *root, Index rti, char *source, int source_sz)
 {
@@ -155,114 +116,6 @@ fqp_get_source_for_rti(PlannerInfo *root, Index rti, char *source, int source_sz
         return false;
 
     return fqp_get_source_for_rte(fqp_rt_fetch(root, rti), source, source_sz);
-}
-
-static bool
-fqp_get_source_for_rel(PlannerInfo *root, RelOptInfo *rel, FqpRelSiteInfo *site)
-{
-    if (site == NULL)
-        return false;
-
-    site->dest_rti = 0;
-    site->source[0] = '\0';
-    site->has_remote_site = false;
-
-    if (root == NULL || rel == NULL)
-        return false;
-
-    if (IS_SIMPLE_REL(rel))
-    {
-        if (fqp_get_source_for_rti(root, rel->relid, site->source, sizeof(site->source)))
-        {
-            site->dest_rti = (int) rel->relid;
-            site->has_remote_site = true;
-            return true;
-        }
-
-        return false;
-    }
-
-    if (rel->reloptkind == RELOPT_JOINREL &&
-        rel->cheapest_total_path != NULL &&
-        rel->cheapest_total_path->pathtype == T_CustomScan)
-    {
-        CustomPath *cp = (CustomPath *) rel->cheapest_total_path;
-
-        site->dest_rti = fqp_dest_rti_from_custom_private(cp->custom_private);
-        if (site->dest_rti <= 0)
-            return false;
-
-        if (fqp_get_source_for_rti(root, (Index) site->dest_rti, site->source, sizeof(site->source)))
-        {
-            site->has_remote_site = true;
-            return true;
-        }
-
-        site->dest_rti = 0;
-    }
-
-    return false;
-}
-
-static bool
-fqp_candidate_source_exists(PlannerInfo *root, int *candidate_dests, int candidate_count, const char *source)
-{
-    int i;
-
-    if (root == NULL || candidate_dests == NULL || source == NULL || source[0] == '\0')
-        return false;
-
-    for (i = 0; i < candidate_count; i++)
-    {
-        int existing_dest_rti;
-        char existing_source[64];
-
-        existing_dest_rti = candidate_dests[i];
-        if (existing_dest_rti <= 0)
-            continue;
-
-        existing_source[0] = '\0';
-        if (!fqp_get_source_for_rti(root, (Index) existing_dest_rti, existing_source, sizeof(existing_source)))
-            continue;
-
-        if (strcmp(existing_source, source) == 0)
-            return true;
-    }
-
-    return false;
-}
-
-static bool
-fqp_requires_data_movement(bool rel_remote,
-                           const FqpRelSiteInfo *rel_site,
-                           int candidate_dest_rti,
-                           const char *candidate_source)
-{
-    if (!rel_remote)
-        return (candidate_dest_rti != 0);
-
-    if (candidate_dest_rti == 0)
-        return true;
-
-    if (rel_site == NULL || rel_site->source[0] == '\0')
-        return true;
-
-    if (candidate_source == NULL || candidate_source[0] == '\0')
-        return true;
-
-    return strcmp(rel_site->source, candidate_source) != 0;
-}
-
-static Cost
-fqp_data_movement_cost(Cardinality rows, int width)
-{
-    double factor;
-
-    if (rows <= 0 || width <= 0)
-        return 0.0;
-
-    factor = mock_table_data_movement_factor();
-    return (Cost) (factor * (double) rows * (double) width);
 }
 
 static bool is_remote_table(Oid relid) {
@@ -299,7 +152,6 @@ static void begin_exchange_scan(CustomScanState *node, EState *estate, int eflag
     if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
         return;
 
-    // TODO: bring data from remote
     elog(ERROR, "Execution reached local mock node. FQP Orchestrator failed to intercept the plan.");
 }
 
@@ -364,7 +216,7 @@ explain_exchange_scan(CustomScanState *node, List *ancestors, ExplainState *es)
     remote_filters = NIL;
     remote_projections = NIL;
     dpcontext = set_deparse_context_plan(es->deparse_cxt, node->ss.ps.plan, ancestors);
-    useprefix = true;//(es->rtable_size > 1 || es->verbose);
+    useprefix = true; //(es->rtable_size > 1 || es->verbose);
 
     foreach(lc, cscan->custom_exprs)
     {
@@ -469,7 +321,6 @@ static Plan *create_exchange_plan(PlannerInfo *root, RelOptInfo *rel, struct Cus
     
     cscan->scan.plan.targetlist = tlist;
 
-    /* All quals are expected to be evaluated remotely. */
     cscan->scan.plan.qual = NIL;
     cscan->scan.scanrelid = scanrelid;
 
@@ -496,12 +347,6 @@ static CustomPathMethods exchange_path_methods = {
     create_exchange_plan,
     NULL
 };
-
-static List *
-fqp_make_custom_private_dest_rti(int dest_rti)
-{
-    return list_make1(makeInteger(dest_rti));
-}
 
 static List *
 fqp_make_custom_private_join(int dest_rti, List *restrictlist)
@@ -592,7 +437,6 @@ fqp_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTb
 
             if (got_remote_cost)
             {
-                // elog(LOG, "mock_table remote explain (baserel rti=%d): %s", (int) rti, sql);
                 elog(LOG,
                      "mock_table remote parsed base cost used (rti=%d source=%s): startup=%.3f total=%.3f rows=%.0f width=%d",
                      (int) rti,
@@ -621,8 +465,7 @@ fqp_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTb
         cpath->flags = 0;
         cpath->custom_paths = NIL;
 
-        // annotation - remote baserel - should I change this to string?
-        cpath->custom_private = fqp_make_custom_private_dest_rti((int) rti);
+        cpath->custom_private = list_make1(makeInteger((int) rti));
         cpath->methods = &exchange_path_methods;
 
         add_path(rel, (Path *) cpath);
@@ -759,9 +602,7 @@ fqp_is_final_joinrel(PlannerInfo *root, RelOptInfo *joinrel)
     if (joinrel->relids == NULL || root->all_baserels == NULL)
         return false;
 
-    /* * Fast path: If the bitmaps match directly, it's definitively the final joinrel.
-     * This handles queries that don't involve mixed-schema table mappings.
-     */
+    // If the bitmaps match directly, it's the final joinrel.
     if (bms_is_subset(root->all_baserels, joinrel->relids))
     {
         elog(LOG, "fqp_is_final_joinrel: Fast path hit. root->all_baserels is subset of joinrel->relids.");
@@ -770,7 +611,7 @@ fqp_is_final_joinrel(PlannerInfo *root, RelOptInfo *joinrel)
 
     elog(LOG, "fqp_is_final_joinrel: Fast path failed. Falling back to schema-agnostic name matching.");
 
-    /* * Federated Schema-Agnostic Path: 
+    /*
      * Check if every base relation in the query root has a corresponding relation 
      * with the same base table name in the joinrel, ignoring the schema.
      */
