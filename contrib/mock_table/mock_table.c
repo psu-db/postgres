@@ -112,7 +112,7 @@ fqp_source_exists(List *sources, const char *source)
 static bool
 fqp_get_source_for_rti(PlannerInfo *root, Index rti, char *source, int source_sz)
 {
-    if (root == NULL || source == NULL || source_sz <= 1 || rti <= 0)
+    if (root == NULL || rti <= 0)
         return false;
 
     return fqp_get_source_for_rte(fqp_rt_fetch(root, rti), source, source_sz);
@@ -179,7 +179,7 @@ fqp_dest_rti_from_custom_private(List *custom_private)
         return 0;
 
     Node *n = (Node *) linitial(custom_private);
-    if (n == NULL || !IsA(n, Integer))
+    if (!IsA(n, Integer))
         return 0;
 
     // destination rti (0 -> local, other -> remote rti)
@@ -227,22 +227,19 @@ explain_exchange_scan(CustomScanState *node, List *ancestors, ExplainState *es)
                                      deparse_expression(expr, dpcontext, useprefix, false));
     }
 
-    if (cscan->custom_private != NIL && list_length(cscan->custom_private) > 1)
+    if (list_length(cscan->custom_private) > 1)
     {
         List *restrictlist = (List *) lsecond(cscan->custom_private);
 
-        if (restrictlist != NIL)
+        List *actual_clauses = get_actual_clauses(restrictlist);
+
+        foreach(lc, actual_clauses)
         {
-            List *actual_clauses = get_actual_clauses(restrictlist);
+            Node *expr = (Node *) lfirst(lc);
 
-            foreach(lc, actual_clauses)
-            {
-                Node *expr = (Node *) lfirst(lc);
-
-                if (expr != NULL)
-                    remote_filters = lappend(remote_filters,
-                                             deparse_expression(expr, dpcontext, useprefix, false));
-            }
+            if (expr != NULL)
+                remote_filters = lappend(remote_filters,
+                                         deparse_expression(expr, dpcontext, useprefix, false));
         }
     }
 
@@ -453,7 +450,7 @@ fqp_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTb
             fqp_log_remote_base_explain(rte, rti);
 
         movement_factor = mock_table_data_movement_factor();
-        data_movement_cost = (plan_rows > 0) ? (Cost) (movement_factor * (double) plan_rows * (double) plan_width) : 0.0;
+        data_movement_cost = (Cost) (movement_factor * (double) plan_rows * (double) plan_width);
         total_cost += data_movement_cost;
 
         cpath->path.rows = plan_rows;
@@ -594,8 +591,6 @@ reloptinfo_dest_rti(PlannerInfo *root, RelOptInfo *rel)
 static bool
 fqp_is_final_joinrel(PlannerInfo *root, RelOptInfo *joinrel)
 {
-    int member = -1;
-
     if (root == NULL || joinrel == NULL)
         return false;
 
@@ -609,64 +604,7 @@ fqp_is_final_joinrel(PlannerInfo *root, RelOptInfo *joinrel)
         return true;
     }
 
-    elog(LOG, "fqp_is_final_joinrel: Fast path failed. Falling back to schema-agnostic name matching.");
-
-    /*
-     * Check if every base relation in the query root has a corresponding relation 
-     * with the same base table name in the joinrel, ignoring the schema.
-     */
-    while ((member = bms_next_member(root->all_baserels, member)) >= 0)
-    {
-        RangeTblEntry *rte_root = fqp_rt_fetch(root, (Index) member);
-        char *root_relname;
-        bool found_match = false;
-        int join_member = -1;
-
-        /* Only process actual relations */
-        if (rte_root == NULL || rte_root->rtekind != RTE_RELATION)
-            continue;
-
-        root_relname = get_rel_name(rte_root->relid);
-        if (root_relname == NULL)
-            continue;
-
-        elog(LOG, "fqp_is_final_joinrel: Checking root RTI %d (table: %s)", member, root_relname);
-
-        /* Search the joinrel for a table with the identical unqualified name */
-        while ((join_member = bms_next_member(joinrel->relids, join_member)) >= 0)
-        {
-            RangeTblEntry *rte_join = fqp_rt_fetch(root, (Index) join_member);
-            char *join_relname;
-
-            if (rte_join == NULL || rte_join->rtekind != RTE_RELATION)
-                continue;
-
-            join_relname = get_rel_name(rte_join->relid);
-            if (join_relname == NULL)
-                continue;
-
-            elog(LOG, "fqp_is_final_joinrel:   Comparing against joinrel RTI %d (table: %s)", join_member, join_relname);
-
-            if (strcmp(root_relname, join_relname) == 0)
-            {
-                elog(LOG, "fqp_is_final_joinrel:   -> Match found! (root RTI %d == joinrel RTI %d by name %s)", member, join_member, root_relname);
-                found_match = true;
-                break; /* Move on to the next root relation */
-            }
-        }
-
-        /* * If we found a table in the query root that is NOT represented 
-         * by name in this joinrel, it is not the final join.
-         */
-        if (!found_match)
-        {
-            elog(LOG, "fqp_is_final_joinrel: Root table %s (RTI %d) NOT found in joinrel. Returning false.", root_relname, member);
-            return false;
-        }
-    }
-
-    elog(LOG, "fqp_is_final_joinrel: All root relations found in joinrel by name. Returning true.");
-    return true;
+    return false;
 }
 
 static bool
@@ -707,6 +645,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     int dest_rti;
     int source_count;
     bool is_mixed_local_remote;
+    bool has_local_candidate = false;
     List *sources;
     ListCell *lc;
 
@@ -728,25 +667,6 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
 
     is_mixed_local_remote = ((outerRel != 0 && innerRel == 0) ||
                              (outerRel == 0 && innerRel != 0));
-
-    // if (is_mixed_local_remote) {
-    //     double local_rows;
-
-    //     elog(LOG,
-    //          "mock_table: joinrel mixed local-remote (outer_dest_rti=%d inner_dest_rti=%d), evaluating remote probe candidate",
-    //          outerRel,
-    //          innerRel);
-
-    //     local_rows = (outerRel == 0) ? outerrel->rows : innerrel->rows;
-    //     if (local_rows > FQP_MAX_LOCAL_ROWS_FOR_REMOTE_PROBE)
-    //     {
-    //         elog(LOG,
-    //              "mock_table: local relation too large (%.0f rows) to push to remote, skipping remote EXPLAIN",
-    //              local_rows);
-    //         return;
-    //     }
-    // }
-    
 
     cpath = makeNode(CustomPath);
     cpath->path.pathtype = T_CustomScan;
@@ -775,11 +695,18 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
 
         if (fqp_get_source_for_rti(root, (Index) outerRel, outer_source, sizeof(outer_source)))
         {
-            FqpSourceCandidate *cand = (FqpSourceCandidate *) palloc(sizeof(FqpSourceCandidate));
+            if (fqp_is_local_candidate_source(outer_source))
+            {
+                has_local_candidate = true;
+            }
+            else
+            {
+                FqpSourceCandidate *cand = (FqpSourceCandidate *) palloc(sizeof(FqpSourceCandidate));
 
-            cand->source = pstrdup(outer_source);
-            cand->rti = outerRel;
-            sources = lappend(sources, cand);
+                cand->source = pstrdup(outer_source);
+                cand->rti = outerRel;
+                sources = lappend(sources, cand);
+            }
         }
     }
 
@@ -787,18 +714,30 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     {
         char inner_source[64];
 
-        if (fqp_get_source_for_rti(root, (Index) innerRel, inner_source, sizeof(inner_source)) &&
-            !fqp_source_exists(sources, inner_source))
+        if (fqp_get_source_for_rti(root, (Index) innerRel, inner_source, sizeof(inner_source)))
         {
-            FqpSourceCandidate *cand = (FqpSourceCandidate *) palloc(sizeof(FqpSourceCandidate));
+            if (fqp_is_local_candidate_source(inner_source))
+            {
+                has_local_candidate = true;
+            }
+            else if (!fqp_source_exists(sources, inner_source))
+            {
+                FqpSourceCandidate *cand = (FqpSourceCandidate *) palloc(sizeof(FqpSourceCandidate));
 
-            cand->source = pstrdup(inner_source);
-            cand->rti = innerRel;
-            sources = lappend(sources, cand);
+                cand->source = pstrdup(inner_source);
+                cand->rti = innerRel;
+                sources = lappend(sources, cand);
+            }
         }
     }
 
     source_count = list_length(sources);
+
+    if (source_count == 0 && has_local_candidate)
+    {
+        elog(LOG, "mock_table: all join probe candidates are local/self; keeping core planner join paths");
+        return;
+    }
 
     // elog(LOG,
     //      "mock_table: joinrel candidate source scope restricted to annotated outer/inner rels (count=%d)",
@@ -810,7 +749,6 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
         if (source_count > 1)
         {
             bool have_candidate = false;
-            bool saw_nonlocal_candidate = false;
 
             foreach(lc, sources)
             {
@@ -825,16 +763,6 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                 cand_total = total_cost;
                 cand_rows = plan_rows;
                 cand_width = plan_width;
-
-                if (fqp_is_local_candidate_source(cand->source))
-                {
-                    elog(LOG,
-                         "mock_table: skipping self-source join probe candidate (source=%s)",
-                         cand->source);
-                    continue;
-                }
-
-                saw_nonlocal_candidate = true;
 
                 sql = mock_deparse_join_sql_for_source(root,
                                                        joinrel,
@@ -857,8 +785,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                                                         &cand_width))
                     continue;
 
-                cand_movement = (cand_rows > 0) ?
-                    (Cost) (mock_table_data_movement_factor() * (double) cand_rows) : 0.0;
+                cand_movement = (Cost) (mock_table_data_movement_factor() * (double) cand_rows);
                 cand_total += cand_movement;
 
                 elog(LOG,
@@ -881,13 +808,6 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                 }
             }
 
-            if (!saw_nonlocal_candidate)
-            {
-                elog(LOG,
-                     "mock_table: all join probe candidates are local/self; keeping core planner join paths");
-                return;
-            }
-
             got_remote_cost = have_candidate;
             startup_cost = best_startup_cost;
             total_cost = best_total_cost;
@@ -898,14 +818,6 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
         else if (source_count == 1)
         {
             FqpSourceCandidate *cand = (FqpSourceCandidate *) linitial(sources);
-
-            if (fqp_is_local_candidate_source(cand->source))
-            {
-                elog(LOG,
-                     "mock_table: only join probe candidate is local/self (source=%s); keeping core planner join paths",
-                     cand->source);
-                return;
-            }
 
             sql = mock_deparse_join_sql_for_source(root,
                                                    joinrel,
@@ -972,30 +884,11 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     if (supported && source_count >= 1 && got_remote_cost)
     {
         movement_factor = mock_table_data_movement_factor();
-        data_movement_cost = (plan_rows > 0) ? (Cost) (movement_factor * (double) plan_rows * (double) plan_width) : 0.0;
-        // data_movement_cost = (plan_rows > 0) ? (Cost) (movement_factor * (double) plan_rows) : 0.0;
+        data_movement_cost = (Cost) (movement_factor * (double) plan_rows * (double) plan_width);
+        // data_movement_cost = (Cost) (movement_factor * (double) plan_rows);
         total_cost += data_movement_cost;
     }
 
-    // {
-    //     Cost child_startup = 0.0;
-    //     Cost child_total = 0.0;
-
-    //     if (outerrel != NULL && outerrel->cheapest_total_path != NULL)
-    //     {
-    //         child_startup += outerrel->cheapest_total_path->startup_cost;
-    //         child_total += outerrel->cheapest_total_path->total_cost;
-    //     }
-
-    //     if (innerrel != NULL && innerrel->cheapest_total_path != NULL)
-    //     {
-    //         child_startup += innerrel->cheapest_total_path->startup_cost;
-    //         child_total += innerrel->cheapest_total_path->total_cost;
-    //     }
-
-    //     cpath->path.startup_cost = startup_cost + child_startup;
-    //     cpath->path.total_cost = total_cost + child_total;
-    // }
     cpath->path.startup_cost = startup_cost;
     cpath->path.total_cost = total_cost;
     cpath->path.rows = plan_rows;
