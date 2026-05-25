@@ -70,31 +70,7 @@ typedef struct MockFlattenCtx
 	List   *where_conds;
 } MockFlattenCtx;
 
-static void
-mock_append_function_name(StringInfo buf, Oid funcid, bool *supported)
-{
-	HeapTuple	proctup;
-	Form_pg_proc procform;
 
-	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
-	if (!HeapTupleIsValid(proctup))
-	{
-		*supported = false;
-		return;
-	}
-
-	procform = (Form_pg_proc) GETSTRUCT(proctup);
-	if (procform->pronamespace != PG_CATALOG_NAMESPACE)
-	{
-		const char *schemaname;
-
-		schemaname = get_namespace_name(procform->pronamespace);
-		appendStringInfo(buf, "%s.", quote_identifier(schemaname));
-	}
-
-	appendStringInfoString(buf, quote_identifier(NameStr(procform->proname)));
-	ReleaseSysCache(proctup);
-}
 
 static void
 mock_append_operator_name(StringInfo buf, Oid opno, bool *supported)
@@ -275,27 +251,7 @@ mock_deparse_bool_expr(StringInfo buf, PlannerInfo *root, BoolExpr *expr,
 	appendStringInfoChar(buf, ')');
 }
 
-static void
-mock_deparse_func_expr(StringInfo buf, PlannerInfo *root, FuncExpr *expr,
-					   bool *supported)
-{
-	ListCell   *lc;
-	bool		first = true;
 
-	mock_append_function_name(buf, expr->funcid, supported);
-	if (!*supported)
-		return;
-
-	appendStringInfoChar(buf, '(');
-	foreach(lc, expr->args)
-	{
-		if (!first)
-			appendStringInfoString(buf, ", ");
-		mock_deparse_expr(buf, root, lfirst(lc), supported);
-		first = false;
-	}
-	appendStringInfoChar(buf, ')');
-}
 
 static void
 mock_deparse_op_expr(StringInfo buf, PlannerInfo *root, OpExpr *expr,
@@ -370,7 +326,8 @@ mock_deparse_expr(StringInfo buf, PlannerInfo *root, Node *node, bool *supported
 			mock_deparse_null_test(buf, root, (NullTest *) node, supported);
 			break;
 		case T_FuncExpr:
-			mock_deparse_func_expr(buf, root, (FuncExpr *) node, supported);
+			*supported = false;
+			appendStringInfo(buf, "<unsupported-node:%d>", (int) nodeTag(node));
 			break;
 		default:
 			*supported = false;
@@ -429,7 +386,6 @@ mock_append_unique_clause(List **clauses, RestrictInfo *rinfo)
 	if (rinfo == NULL)
 		return;
 
-	/* Minimal cross-version deduplication. */
 	foreach(lc, *clauses)
 	{
 		RestrictInfo *existing = lfirst_node(RestrictInfo, lc);
@@ -617,7 +573,7 @@ mock_deparse_join_sql_for_source(PlannerInfo *root,
 	prev_dest_source = mock_deparse_dest_source;
 	mock_deparse_dest_source = dest_source;
 
-	/* Current prototype supports only inner joins for flattened SQL. */
+	// only inner join supported
 	if (jointype != JOIN_INNER)
 	{
 		*supported = false;
@@ -626,7 +582,6 @@ mock_deparse_join_sql_for_source(PlannerInfo *root,
 		return buf.data;
 	}
 
-	/* Flatten nested joinrels to base relations and collect their quals. */
 	mock_collect_rel_tree(outerrel, &ctx, supported);
 	mock_collect_rel_tree(innerrel, &ctx, supported);
 	mock_append_unique_clause_list(&ctx.where_conds, restrictlist);
