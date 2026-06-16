@@ -43,10 +43,7 @@ mock_interface_port_for_source(const char *source)
 		return mock_interface_http_base_port;
 
 	n = strtol(p, &endptr, 10);
-	if (*endptr != '\0' || n <= 0)
-		return mock_interface_http_base_port;
-
-	if (n > 10000)
+	if (*endptr != '\0')
 		return mock_interface_http_base_port;
 
 	return mock_interface_http_base_port + ((int) n - 1);

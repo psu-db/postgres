@@ -243,7 +243,8 @@ explain_exchange_scan(CustomScanState *node, List *ancestors, ExplainState *es)
         }
     }
 
-    foreach(lc, cscan->custom_scan_tlist)
+    List *tlist_to_deparse = (cscan->custom_scan_tlist != NIL) ? cscan->custom_scan_tlist : cscan->scan.plan.targetlist;
+    foreach(lc, tlist_to_deparse)
     {
         TargetEntry *tle = (TargetEntry *) lfirst(lc);
 
@@ -275,12 +276,21 @@ explain_exchange_scan(CustomScanState *node, List *ancestors, ExplainState *es)
     else
         dest_text = "remote (source=unknown)";
 
+    double data_movement_cost = 0.0;
+    if (dest_rti > 0)
+    {
+        double movement_factor = mock_table_data_movement_factor();
+        data_movement_cost = movement_factor * (double) cscan->scan.plan.plan_rows * (double) cscan->scan.plan.plan_width;
+    }
+    double op_cost = (double) cscan->scan.plan.total_cost - data_movement_cost;
     ExplainPropertyText("FQP Annotation", dest_text, es);
     ExplainPropertyText("FQP Scan Kind", scan_kind, es);
+    ExplainPropertyFloat("FQP Data Movement Cost", NULL, data_movement_cost, 2, es);
+    ExplainPropertyFloat("FQP Op Cost", NULL, op_cost, 2, es);
     // ExplainPropertyText("FQP Annotation Source", has_dest_source ? dest_source : (dest_rti == 0 ? "local" : "unknown"), es);
     // ExplainPropertyInteger("FQP Annotation RTI", NULL, dest_rti, es);
     ExplainPropertyInteger("FQP Remote Expr Count", NULL, remote_expr_count, es);
-    ExplainPropertyInteger("FQP Remote Projection Count", NULL, remote_projection_count, es);
+    // ExplainPropertyInteger("FQP Remote Projection Count", NULL, remote_projection_count, es);
     if (remote_filters != NIL)
         ExplainPropertyList("FQP Remote Filters", remote_filters, es);
     if (remote_projections != NIL)
@@ -321,10 +331,13 @@ static Plan *create_exchange_plan(PlannerInfo *root, RelOptInfo *rel, struct Cus
     cscan->scan.plan.qual = NIL;
     cscan->scan.scanrelid = scanrelid;
 
-    if (scanrelid == 0)
+    if (scanrelid == 0) // not a baserel
         cscan->custom_scan_tlist = tlist;
     else
+    {
+        cscan->custom_scan_tlist = NIL; // no targetlist for baserel
         cscan->custom_exprs = extract_actual_clauses(clauses, false); // type mismatch if clauses directly stored
+    }
 
     // propagate estimates so explain shows rows/width
     cscan->scan.plan.plan_rows = best_path->path.rows;
@@ -407,9 +420,10 @@ fqp_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTb
         (void) fqp_get_source_for_rte(rte, source, sizeof(source));
 
         sql = mock_deparse_base_sql_for_source(root,
-                               rel,
-                               (source[0] != '\0') ? source : NULL,
-                               &supported);
+                       rel,
+                       cpath->path.pathtarget,
+                       (source[0] != '\0') ? source : NULL,
+                       &supported);
         startup_cost = 150.0;
         total_cost = 150.0 + (rel->tuples * 0.05);
         plan_rows = rel->rows;
@@ -503,9 +517,10 @@ fqp_get_relation_info_hook(PlannerInfo *root, Oid relOid, bool inhparent, RelOpt
             (void) fqp_get_source_for_rte(rte, source, sizeof(source));
 
         sql = mock_deparse_base_sql_for_source(root,
-                                               rel,
-                                               (source[0] != '\0') ? source : NULL,
-                                               &supported);
+                               rel,
+                               rel->reltarget,
+                               (source[0] != '\0') ? source : NULL,
+                               &supported);
 
         if (supported)
         {

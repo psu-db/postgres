@@ -40,13 +40,15 @@ extern bool mock_remote_explain_sql_for_source(const char *source,
 								   int *width);
 
 extern char *mock_deparse_base_sql(PlannerInfo *root,
-							RelOptInfo *rel,
-							bool *supported);
+						 RelOptInfo *rel,
+						 PathTarget *target,
+						 bool *supported);
 
 extern char *mock_deparse_base_sql_for_source(PlannerInfo *root,
-								   RelOptInfo *rel,
-								   const char *dest_source,
-								   bool *supported);
+							   RelOptInfo *rel,
+							   PathTarget *target,
+							   const char *dest_source,
+							   bool *supported);
 
 extern char *mock_deparse_join_sql(PlannerInfo *root,
 								 RelOptInfo *joinrel,

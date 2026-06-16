@@ -624,12 +624,14 @@ mock_deparse_join_sql_for_source(PlannerInfo *root,
 
 char *
 mock_deparse_base_sql_for_source(PlannerInfo *root,
-						 RelOptInfo *rel,
-						 const char *dest_source,
-						 bool *supported)
+					 RelOptInfo *rel,
+					 PathTarget *target,
+					 const char *dest_source,
+					 bool *supported)
 {
 	StringInfoData buf;
 	const char *prev_dest_source;
+	List       *target_exprs;
 
 	*supported = true;
 	initStringInfo(&buf);
@@ -644,8 +646,10 @@ mock_deparse_base_sql_for_source(PlannerInfo *root,
 		return buf.data;
 	}
 
+	target_exprs = (target != NULL) ? target->exprs : rel->reltarget->exprs;
+
 	appendStringInfoString(&buf, "SELECT ");
-	mock_append_target_list(&buf, root, rel->reltarget->exprs, supported);
+	mock_append_target_list(&buf, root, target_exprs, supported);
 
 	if (!*supported)
 	{
@@ -697,7 +701,8 @@ mock_deparse_join_sql(PlannerInfo *root,
 char *
 mock_deparse_base_sql(PlannerInfo *root,
 					 RelOptInfo *rel,
+					 PathTarget *target,
 					 bool *supported)
 {
-	return mock_deparse_base_sql_for_source(root, rel, NULL, supported);
+	return mock_deparse_base_sql_for_source(root, rel, target, NULL, supported);
 }
