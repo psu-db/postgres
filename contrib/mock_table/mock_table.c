@@ -11,6 +11,7 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/paths.h"
+#include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "parser/parse_relation.h"
 #include "commands/explain.h"
@@ -649,14 +650,10 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     char *sql;
     Cost startup_cost;
     Cost total_cost;
-    Cost best_startup_cost;
-    Cost best_total_cost;
     Cost data_movement_cost;
     double movement_factor;
     Cardinality plan_rows;
-    Cardinality best_rows;
     int plan_width;
-    int best_width;
     int dest_rti;
     int source_count;
     bool is_mixed_local_remote;
@@ -695,10 +692,6 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     total_cost = DBL_MAX;
     plan_rows = joinrel->rows;
     plan_width = joinrel->reltarget->width;
-    best_startup_cost = startup_cost;
-    best_total_cost = total_cost;
-    best_rows = plan_rows;
-    best_width = plan_width;
     dest_rti = (outerRel != 0) ? outerRel : innerRel;
     got_remote_cost = false;
     sources = NIL;
@@ -760,24 +753,26 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
 
     if (supported)
     {
-        // children have different remote annotations 
-        if (source_count > 1)
+        if (sources != NIL)
         {
-            bool have_candidate = false;
-
             foreach(lc, sources)
             {
                 FqpSourceCandidate *cand = (FqpSourceCandidate *) lfirst(lc);
+                CustomPath *cand_path;
                 Cost cand_startup;
                 Cost cand_total;
                 Cardinality cand_rows;
                 int cand_width;
                 Cost cand_movement;
+                bool cand_supported;
+                bool cand_got_remote_cost;
 
-                cand_startup = startup_cost;
-                cand_total = total_cost;
-                cand_rows = plan_rows;
-                cand_width = plan_width;
+                cand_startup = DBL_MAX;
+                cand_total = DBL_MAX;
+                cand_rows = joinrel->rows;
+                cand_width = joinrel->reltarget->width;
+                cand_supported = true;
+                cand_got_remote_cost = false;
 
                 sql = mock_deparse_join_sql_for_source(root,
                                                        joinrel,
@@ -786,21 +781,23 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                                                        jointype,
                                                        (extra != NULL) ? extra->restrictlist : NIL,
                                                        cand->source,
-                                                       &supported);
-                if (!supported)
+                                                       &cand_supported);
+                if (!cand_supported)
                     continue;
 
                 elog(LOG, "mock_table remote explain (join source=%s): EXPLAIN %s", cand->source, sql);
 
-                if (!mock_remote_explain_sql_for_source(cand->source,
-                                                        sql,
-                                                        &cand_startup,
-                                                        &cand_total,
-                                                        &cand_rows,
-                                                        &cand_width))
+                cand_got_remote_cost = mock_remote_explain_sql_for_source(cand->source,
+                                                                          sql,
+                                                                          &cand_startup,
+                                                                          &cand_total,
+                                                                          &cand_rows,
+                                                                          &cand_width);
+                if (!cand_got_remote_cost)
                     continue;
 
-                cand_movement = (Cost) (mock_table_data_movement_factor() * (double) cand_rows);
+                movement_factor = mock_table_data_movement_factor();
+                cand_movement = (Cost) (movement_factor * (double) cand_rows * (double) cand_width);
                 cand_total += cand_movement;
 
                 elog(LOG,
@@ -812,48 +809,28 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                      cand_width,
                      cand_movement);
 
-                if (!have_candidate || cand_total < best_total_cost)
-                {
-                    best_startup_cost = cand_startup;
-                    best_total_cost = cand_total;
-                    best_rows = cand_rows;
-                    best_width = cand_width;
-                    dest_rti = cand->rti;
-                    have_candidate = true;
-                }
+                cand_path = makeNode(CustomPath);
+                cand_path->path.pathtype = T_CustomScan;
+                cand_path->path.parent = joinrel;
+                cand_path->path.pathtarget = copy_pathtarget(joinrel->reltarget);
+                cand_path->path.startup_cost = cand_startup;
+                cand_path->path.total_cost = cand_total;
+                cand_path->path.rows = cand_rows;
+                if (cand_width > 0)
+                    cand_path->path.pathtarget->width = cand_width;
+                cand_path->flags = 0;
+                cand_path->custom_private = fqp_make_custom_private_join(cand->rti, (extra != NULL) ? extra->restrictlist : NIL);
+                cand_path->custom_paths = list_make2(outerrel->cheapest_total_path, innerrel->cheapest_total_path);
+                cand_path->methods = &exchange_path_methods;
+
+                add_path(joinrel, (Path *) cand_path);
+                got_remote_cost = true;
             }
 
-            got_remote_cost = have_candidate;
-            startup_cost = best_startup_cost;
-            total_cost = best_total_cost;
-            plan_rows = best_rows;
-            plan_width = best_width;
-        }
-        // children have atleast one remote annotation
-        else if (source_count == 1)
-        {
-            FqpSourceCandidate *cand = (FqpSourceCandidate *) linitial(sources);
+            if (got_remote_cost)
+                elog(LOG, "mock_table: added remote-remote custom join paths for joinrel");
 
-            sql = mock_deparse_join_sql_for_source(root,
-                                                   joinrel,
-                                                   outerrel,
-                                                   innerrel,
-                                                   jointype,
-                                                   (extra != NULL) ? extra->restrictlist : NIL,
-                                                   cand->source,
-                                                   &supported);
-
-            if (supported)
-            {
-                elog(LOG, "mock_table remote explain (join source=%s): EXPLAIN %s", cand->source, sql);
-                got_remote_cost = mock_remote_explain_sql_for_source(cand->source,
-                                                                      sql,
-                                                                      &startup_cost,
-                                                                      &total_cost,
-                                                                      &plan_rows,
-                                                                      &plan_width);
-            }
-            dest_rti = cand->rti;
+            return;
         }
         else
         {
@@ -863,6 +840,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                      "mock_table: mixed local-remote join has no remote source candidate; skipping generic remote EXPLAIN fallback (outer_dest_rti=%d inner_dest_rti=%d)",
                      outerRel,
                      innerRel);
+                return;
             }
             else
             {
@@ -896,11 +874,10 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
              (double) plan_rows,
              plan_width);
 
-    if (supported && source_count >= 1 && got_remote_cost)
+    if (supported && got_remote_cost)
     {
         movement_factor = mock_table_data_movement_factor();
         data_movement_cost = (Cost) (movement_factor * (double) plan_rows * (double) plan_width);
-        // data_movement_cost = (Cost) (movement_factor * (double) plan_rows);
         total_cost += data_movement_cost;
     }
 
