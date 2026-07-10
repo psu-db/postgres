@@ -1,0 +1,4 @@
+comment = 'Mock Table to simulate remote tables with specific cost and cardinality'
+default_version = '1.0'
+module_pathname = '$libdir/mock_table'
+relocatable = true
