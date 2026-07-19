@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include <curl/curl.h>
+#include "portability/instr_time.h"
 #include "utils/guc.h"
 #include "utils/json.h"
 #include "utils/memutils.h"
@@ -220,9 +221,20 @@ mock_remote_explain_sql_for_source(const char *source,
 	bool		has_rows;
 	bool		has_width;
 	bool		ok = false;
+	instr_time	request_start;
+	instr_time	request_duration;
+	double		elapsed_ms = 0.0;
 
 	if (sql == NULL || startup_cost == NULL || total_cost == NULL)
 		return false;
+
+	startup = 0.0;
+	total = 0.0;
+	plan_rows = 0.0;
+	plan_width = 0.0;
+	has_rows = false;
+	has_width = false;
+	INSTR_TIME_SET_CURRENT(request_start);
 
 	target_host = (mock_interface_host != NULL && mock_interface_host[0] != '\0') ?
 		mock_interface_host : "127.0.0.1";
@@ -330,6 +342,17 @@ mock_remote_explain_sql_for_source(const char *source,
 	ok = true;
 
 done:
+	INSTR_TIME_SET_CURRENT(request_duration);
+	INSTR_TIME_SUBTRACT(request_duration, request_start);
+	elapsed_ms = INSTR_TIME_GET_MILLISEC(request_duration);
+	mock_table_record_remote_explain(source,
+									 sql,
+									 ok,
+									 elapsed_ms,
+									 ok ? (Cost) startup : 0.0,
+									 ok ? (Cost) total : 0.0,
+									 (ok && has_rows) ? (Cardinality) plan_rows : 0.0,
+									 (ok && has_width) ? (int) plan_width : 0);
 	if (headers != NULL)
 		curl_slist_free_all(headers);
 	if (curl != NULL)

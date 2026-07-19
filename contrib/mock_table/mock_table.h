@@ -39,6 +39,15 @@ extern bool mock_remote_explain_sql_for_source(const char *source,
 								   Cardinality *rows,
 								   int *width);
 
+extern void mock_table_record_remote_explain(const char *target_source,
+									 const char *sql,
+									 bool ok,
+									 double elapsed_ms,
+									 Cost startup_cost,
+									 Cost total_cost,
+									 Cardinality rows,
+									 int width);
+
 extern char *mock_deparse_base_sql(PlannerInfo *root,
 						 RelOptInfo *rel,
 						 PathTarget *target,
