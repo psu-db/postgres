@@ -52,6 +52,7 @@ static instr_time fqp_trace_start;
 
 static bool is_remote_table(Oid relid);
 static int fqp_dest_rti_from_custom_private(List *custom_private);
+static bool fqp_is_local_candidate_source(const char *candidate_source);
 static PlannedStmt *fqp_planner_hook(Query *parse,
                                      const char *query_string,
                                      int cursorOptions,
@@ -425,6 +426,22 @@ fqp_source_exists(List *sources, const char *source)
 }
 
 static bool
+fqp_source_rti_exists(List *sources, int rti)
+{
+    ListCell   *lc;
+
+    foreach(lc, sources)
+    {
+        FqpSourceCandidate *cand = (FqpSourceCandidate *) lfirst(lc);
+
+        if (cand->rti == rti)
+            return true;
+    }
+
+    return false;
+}
+
+static bool
 fqp_get_source_for_rti(PlannerInfo *root, Index rti, char *source, int source_sz)
 {
     if (root == NULL || rti <= 0)
@@ -499,6 +516,76 @@ fqp_dest_rti_from_custom_private(List *custom_private)
 
     // destination rti (0 -> local, other -> remote rti)
     return intVal(n);
+}
+
+static bool
+fqp_path_dest_rti(Path *path, int *dest_rti)
+{
+    CustomPath *cp;
+    int         rti;
+
+    if (path == NULL || path->pathtype != T_CustomScan)
+        return false;
+
+    cp = (CustomPath *) path;
+    rti = fqp_dest_rti_from_custom_private(cp->custom_private);
+    if (rti <= 0)
+        return false;
+
+    if (dest_rti != NULL)
+        *dest_rti = rti;
+
+    return true;
+}
+
+static Path *
+fqp_best_path_for_source(PlannerInfo *root, RelOptInfo *rel, const char *source)
+{
+    ListCell   *lc;
+    Path       *best_path;
+    int         path_dest_rti;
+    char        path_source[64];
+
+    if (root == NULL || rel == NULL || source == NULL || source[0] == '\0')
+        return NULL;
+
+    best_path = NULL;
+    foreach(lc, rel->pathlist)
+    {
+        Path *path = (Path *) lfirst(lc);
+
+        if (!fqp_path_dest_rti(path, &path_dest_rti))
+            continue;
+
+        path_source[0] = '\0';
+        if (!fqp_get_source_for_rti(root, (Index) path_dest_rti, path_source, sizeof(path_source)))
+            continue;
+
+        if (strcmp(path_source, source) != 0)
+            continue;
+
+        if (best_path == NULL || compare_path_costs(path, best_path, TOTAL_COST) < 0)
+            best_path = path;
+    }
+
+    return best_path;
+}
+
+static void
+fqp_add_path_keep_interesting_dest(RelOptInfo *rel, Path *path)
+{
+    /*
+     * PostgreSQL does not know that FQP destination/source is a physical
+     * property. A path that is dominated on local cost can still be the only
+     * path at a useful remote destination for an upper join.
+     *
+     * Do not call add_path() here: when it rejects a path it also frees it.
+     * Keep these paths explicitly and let set_cheapest() choose the cheapest
+     * path later while upper FQP joins can still inspect all destinations.
+     */
+    rel->pathlist = lappend(rel->pathlist, path);
+    elog(LOG,
+         "mock_table: preserved FQP destination path for upper joins");
 }
 
 static void
@@ -905,17 +992,82 @@ reloptinfo_dest_rti(PlannerInfo *root, RelOptInfo *rel)
             return 0;
     }
 
-    // For joinrel, use the cheapest path's annotation if it's one of our custom paths. otherwise assume local.
+    // Fallback only. Join enumeration below scans all FQP paths for destinations.
     if (rel->reloptkind == RELOPT_JOINREL) 
     {
-        if (rel->cheapest_total_path && rel->cheapest_total_path->pathtype == T_CustomScan)
-        {
-            CustomPath *cp = (CustomPath *) rel->cheapest_total_path;
-            return fqp_dest_rti_from_custom_private(cp->custom_private);
-        }
+        int dest_rti;
+
+        if (fqp_path_dest_rti(rel->cheapest_total_path, &dest_rti))
+            return dest_rti;
     }
     
     return 0;
+}
+
+static void
+fqp_add_source_candidate_for_rti(PlannerInfo *root,
+                                 List **sources,
+                                 bool *has_local_candidate,
+                                 int rti)
+{
+    char source[64];
+    FqpSourceCandidate *cand;
+
+    if (rti <= 0 || fqp_source_rti_exists(*sources, rti))
+        return;
+
+    source[0] = '\0';
+    if (!fqp_get_source_for_rti(root, (Index) rti, source, sizeof(source)))
+        return;
+
+    if (fqp_is_local_candidate_source(source))
+    {
+        *has_local_candidate = true;
+        return;
+    }
+
+    if (fqp_source_exists(*sources, source))
+        return;
+
+    cand = (FqpSourceCandidate *) palloc(sizeof(FqpSourceCandidate));
+    cand->source = pstrdup(source);
+    cand->rti = rti;
+    *sources = lappend(*sources, cand);
+}
+
+static void
+fqp_collect_source_candidates_from_rel(PlannerInfo *root,
+                                       RelOptInfo *rel,
+                                       List **sources,
+                                       bool *has_local_candidate)
+{
+    ListCell   *lc;
+
+    if (rel == NULL)
+        return;
+
+    if (IS_SIMPLE_REL(rel))
+    {
+        fqp_add_source_candidate_for_rti(root,
+                                         sources,
+                                         has_local_candidate,
+                                         reloptinfo_dest_rti(root, rel));
+        return;
+    }
+
+    foreach(lc, rel->pathlist)
+    {
+        Path *path = (Path *) lfirst(lc);
+        int   dest_rti;
+
+        if (!fqp_path_dest_rti(path, &dest_rti))
+            continue;
+
+        fqp_add_source_candidate_for_rti(root,
+                                         sources,
+                                         has_local_candidate,
+                                         dest_rti);
+    }
 }
 
 static bool
@@ -978,19 +1130,13 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     if (prev_set_join_pathlist_hook)
         prev_set_join_pathlist_hook(root, joinrel, outerrel, innerrel, jointype, extra);
 
-    outerRel = reloptinfo_dest_rti(root, outerrel);
-    innerRel = reloptinfo_dest_rti(root, innerrel);
-
-    if (outerRel == 0 && innerRel == 0) {
-        elog(LOG, "mock_table: joinrel local-local, keeping core planner join paths");
-        return; // both local, do nothing
-    }
-
     if (fqp_is_final_joinrel(root, joinrel)) { // final sink, no changes
         elog(LOG, "mock_table: final joinrel detected, keeping core planner join paths");
         return;
     }
 
+    outerRel = reloptinfo_dest_rti(root, outerrel);
+    innerRel = reloptinfo_dest_rti(root, innerrel);
     is_mixed_local_remote = ((outerRel != 0 && innerRel == 0) ||
                              (outerRel == 0 && innerRel != 0));
 
@@ -1011,53 +1157,20 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     sources = NIL;
     source_count = 0;
 
-    if (outerRel > 0)
-    {
-        char outer_source[64];
-
-        if (fqp_get_source_for_rti(root, (Index) outerRel, outer_source, sizeof(outer_source)))
-        {
-            if (fqp_is_local_candidate_source(outer_source))
-            {
-                has_local_candidate = true;
-            }
-            else
-            {
-                FqpSourceCandidate *cand = (FqpSourceCandidate *) palloc(sizeof(FqpSourceCandidate));
-
-                cand->source = pstrdup(outer_source);
-                cand->rti = outerRel;
-                sources = lappend(sources, cand);
-            }
-        }
-    }
-
-    if (innerRel > 0)
-    {
-        char inner_source[64];
-
-        if (fqp_get_source_for_rti(root, (Index) innerRel, inner_source, sizeof(inner_source)))
-        {
-            if (fqp_is_local_candidate_source(inner_source))
-            {
-                has_local_candidate = true;
-            }
-            else if (!fqp_source_exists(sources, inner_source))
-            {
-                FqpSourceCandidate *cand = (FqpSourceCandidate *) palloc(sizeof(FqpSourceCandidate));
-
-                cand->source = pstrdup(inner_source);
-                cand->rti = innerRel;
-                sources = lappend(sources, cand);
-            }
-        }
-    }
+    fqp_collect_source_candidates_from_rel(root,
+                                           outerrel,
+                                           &sources,
+                                           &has_local_candidate);
+    fqp_collect_source_candidates_from_rel(root,
+                                           innerrel,
+                                           &sources,
+                                           &has_local_candidate);
 
     source_count = list_length(sources);
 
-    if (source_count == 0 && has_local_candidate)
+    if (source_count == 0)
     {
-        elog(LOG, "mock_table: all join probe candidates are local/self; keeping core planner join paths");
+        elog(LOG, "mock_table: joinrel has no remote FQP destination candidates, keeping core planner join paths");
         return;
     }
 
@@ -1080,6 +1193,8 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                 Cost cand_movement;
                 bool cand_supported;
                 bool cand_got_remote_cost;
+                Path *outer_path;
+                Path *inner_path;
 
                 cand_startup = DBL_MAX;
                 cand_total = DBL_MAX;
@@ -1134,10 +1249,16 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                     cand_path->path.pathtarget->width = cand_width;
                 cand_path->flags = 0;
                 cand_path->custom_private = fqp_make_custom_private_join(cand->rti, (extra != NULL) ? extra->restrictlist : NIL);
-                cand_path->custom_paths = list_make2(outerrel->cheapest_total_path, innerrel->cheapest_total_path);
+                outer_path = fqp_best_path_for_source(root, outerrel, cand->source);
+                inner_path = fqp_best_path_for_source(root, innerrel, cand->source);
+                if (outer_path == NULL)
+                    outer_path = outerrel->cheapest_total_path;
+                if (inner_path == NULL)
+                    inner_path = innerrel->cheapest_total_path;
+                cand_path->custom_paths = list_make2(outer_path, inner_path);
                 cand_path->methods = &exchange_path_methods;
 
-                add_path(joinrel, (Path *) cand_path);
+                fqp_add_path_keep_interesting_dest(joinrel, (Path *) cand_path);
                 got_remote_cost = true;
             }
 
@@ -1206,7 +1327,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     cpath->custom_paths = list_make2(outerrel->cheapest_total_path, innerrel->cheapest_total_path);
     cpath->methods = &exchange_path_methods;
 
-    add_path(joinrel, (Path *) cpath);
+    fqp_add_path_keep_interesting_dest(joinrel, (Path *) cpath);
 
     elog(LOG, "mock_table: added remote-remote custom join path for joinrel");
     if (supported && !got_remote_cost)
