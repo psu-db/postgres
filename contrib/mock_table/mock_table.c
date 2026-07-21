@@ -522,21 +522,8 @@ fqp_get_relation_info_hook(PlannerInfo *root, Oid relOid, bool inhparent, RelOpt
 static void
 fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel, JoinType jointype, JoinPathExtraData *extra)
 {
-    int outerRel;
-    int innerRel;
-    CustomPath *cpath;
-    bool supported;
-    bool got_remote_cost;
-    char *sql;
-    Cost startup_cost;
-    Cost total_cost;
-    Cost data_movement_cost;
     double movement_factor;
-    Cardinality plan_rows;
-    int plan_width;
-    int dest_rti;
-    int source_count;
-    bool is_mixed_local_remote;
+    bool got_remote_cost;
     bool has_local_candidate = false;
     List *sources;
     List *join_path_candidates;
@@ -568,28 +555,9 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
     }
 #endif
 
-    outerRel = reloptinfo_dest_rti(root, outerrel);
-    innerRel = reloptinfo_dest_rti(root, innerrel);
-    is_mixed_local_remote = ((outerRel != 0 && innerRel == 0) ||
-                             (outerRel == 0 && innerRel != 0));
-
-    cpath = makeNode(CustomPath);
-    cpath->path.pathtype = T_CustomScan;
-    cpath->path.parent = joinrel;
-    cpath->path.pathtarget = joinrel->reltarget;
-    
-    sql = NULL;
-    supported = true;
-
-    startup_cost = DBL_MAX;
-    total_cost = DBL_MAX;
-    plan_rows = joinrel->rows;
-    plan_width = joinrel->reltarget->width;
-    dest_rti = (outerRel != 0) ? outerRel : innerRel;
     got_remote_cost = false;
     sources = NIL;
     join_path_candidates = NIL;
-    source_count = 0;
 
     fqp_collect_source_candidates_from_rel(root,
                                            outerrel,
@@ -600,178 +568,103 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                                            &sources,
                                            &has_local_candidate);
 
-    source_count = list_length(sources);
-
-    if (source_count == 0)
+    if (sources == NIL)
     {
         elog(LOG, "mock_table: joinrel has no remote FQP destination candidates, keeping core planner join paths");
         return;
     }
 
-    // elog(LOG,
-    //      "mock_table: joinrel candidate source scope restricted to annotated outer/inner rels (count=%d)",
-    //      source_count);
-
-    if (supported)
+    foreach(lc, sources)
     {
-        if (sources != NIL)
-        {
-            foreach(lc, sources)
-            {
-                FqpSourceCandidate *cand = (FqpSourceCandidate *) lfirst(lc);
-                CustomPath *cand_path;
-                Cost cand_startup;
-                Cost cand_total;
-                Cardinality cand_rows;
-                int cand_width;
-                Cost cand_movement;
-                bool cand_supported;
-                bool cand_got_remote_cost;
-                Path *outer_path;
-                Path *inner_path;
+        FqpSourceCandidate *cand = (FqpSourceCandidate *) lfirst(lc);
+        CustomPath *cand_path;
+        Cost cand_startup;
+        Cost cand_total;
+        Cardinality cand_rows;
+        int cand_width;
+        Cost cand_movement;
+        bool cand_supported;
+        bool cand_got_remote_cost;
+        char *sql;
+        Path *outer_path;
+        Path *inner_path;
 
-                cand_startup = DBL_MAX;
-                cand_total = DBL_MAX;
-                cand_rows = joinrel->rows;
-                cand_width = joinrel->reltarget->width;
-                cand_supported = true;
-                cand_got_remote_cost = false;
+        cand_startup = DBL_MAX;
+        cand_total = DBL_MAX;
+        cand_rows = joinrel->rows;
+        cand_width = joinrel->reltarget->width;
+        cand_supported = true;
+        cand_got_remote_cost = false;
 
-                sql = mock_deparse_join_sql_for_source(root,
-                                                       joinrel,
-                                                       outerrel,
-                                                       innerrel,
-                                                       jointype,
-                                                       (extra != NULL) ? extra->restrictlist : NIL,
-                                                       cand->source,
-                                                       &cand_supported);
-                if (!cand_supported)
-                    continue;
+        sql = mock_deparse_join_sql_for_source(root,
+                                               joinrel,
+                                               outerrel,
+                                               innerrel,
+                                               jointype,
+                                               (extra != NULL) ? extra->restrictlist : NIL,
+                                               cand->source,
+                                               &cand_supported);
+        if (!cand_supported)
+            continue;
 
-                elog(LOG, "mock_table remote explain (join source=%s): EXPLAIN %s", cand->source, sql);
+        elog(LOG, "mock_table remote explain (join source=%s): EXPLAIN %s", cand->source, sql);
 
-                cand_got_remote_cost = mock_remote_explain_sql_for_source(cand->source,
-                                                                          sql,
-                                                                          &cand_startup,
-                                                                          &cand_total,
-                                                                          &cand_rows,
-                                                                          &cand_width);
-                if (!cand_got_remote_cost)
-                    continue;
+        cand_got_remote_cost = mock_remote_explain_sql_for_source(cand->source,
+                                                                  sql,
+                                                                  &cand_startup,
+                                                                  &cand_total,
+                                                                  &cand_rows,
+                                                                  &cand_width);
+        if (!cand_got_remote_cost)
+            continue;
 
-                movement_factor = mock_table_data_movement_factor();
-                cand_movement = (Cost) (movement_factor * (double) cand_rows * (double) cand_width);
-                cand_total += cand_movement;
+        movement_factor = mock_table_data_movement_factor();
+        cand_movement = (Cost) (movement_factor * (double) cand_rows * (double) cand_width);
+        cand_total += cand_movement;
 
-                elog(LOG,
-                     "mock_table remote parsed join candidate used (source=%s): startup=%.3f total=%.3f rows=%.0f width=%d movement=%.3f",
-                     cand->source,
-                     cand_startup,
-                     cand_total,
-                     (double) cand_rows,
-                     cand_width,
-                     cand_movement);
+        elog(LOG,
+             "mock_table remote parsed join candidate used (source=%s): startup=%.3f total=%.3f rows=%.0f width=%d movement=%.3f",
+             cand->source,
+             cand_startup,
+             cand_total,
+             (double) cand_rows,
+             cand_width,
+             cand_movement);
 
-                cand_path = makeNode(CustomPath);
-                cand_path->path.pathtype = T_CustomScan;
-                cand_path->path.parent = joinrel;
-                cand_path->path.pathtarget = copy_pathtarget(joinrel->reltarget);
-                cand_path->path.startup_cost = cand_startup;
-                cand_path->path.total_cost = cand_total;
-                cand_path->path.rows = cand_rows;
-                if (cand_width > 0)
-                    cand_path->path.pathtarget->width = cand_width;
-                cand_path->flags = 0;
-                cand_path->custom_private = fqp_make_custom_private_join(cand->rti, (extra != NULL) ? extra->restrictlist : NIL);
-                outer_path = fqp_best_path_for_source(root, outerrel, cand->source);
-                inner_path = fqp_best_path_for_source(root, innerrel, cand->source);
-                if (outer_path == NULL)
-                    outer_path = outerrel->cheapest_total_path;
-                if (inner_path == NULL)
-                    inner_path = innerrel->cheapest_total_path;
-                cand_path->custom_paths = list_make2(outer_path, inner_path);
-                cand_path->methods = &exchange_path_methods;
+        cand_path = makeNode(CustomPath);
+        cand_path->path.pathtype = T_CustomScan;
+        cand_path->path.parent = joinrel;
+        cand_path->path.pathtarget = copy_pathtarget(joinrel->reltarget);
+        cand_path->path.startup_cost = cand_startup;
+        cand_path->path.total_cost = cand_total;
+        cand_path->path.rows = cand_rows;
+        if (cand_width > 0)
+            cand_path->path.pathtarget->width = cand_width;
+        cand_path->flags = 0;
+        cand_path->custom_private = fqp_make_custom_private_join(cand->rti, (extra != NULL) ? extra->restrictlist : NIL);
+        outer_path = fqp_best_path_for_source(root, outerrel, cand->source);
+        inner_path = fqp_best_path_for_source(root, innerrel, cand->source);
+        if (outer_path == NULL)
+            outer_path = outerrel->cheapest_total_path;
+        if (inner_path == NULL)
+            inner_path = innerrel->cheapest_total_path;
+        cand_path->custom_paths = list_make2(outer_path, inner_path);
+        cand_path->methods = &exchange_path_methods;
 
-                fqp_add_ranked_join_path_candidate(&join_path_candidates,
-                                                   cand_path,
-                                                   cand->source);
-                got_remote_cost = true;
-            }
-
-            if (got_remote_cost)
-            {
-                fqp_preserve_top_join_path_candidates(joinrel,
-                                                      join_path_candidates);
-                elog(LOG, "mock_table: added remote-remote custom join paths for joinrel");
-            }
-
-            return;
-        }
-        else
-        {
-            if (is_mixed_local_remote)
-            {
-                elog(LOG,
-                     "mock_table: mixed local-remote join has no remote source candidate; skipping generic remote EXPLAIN fallback (outer_dest_rti=%d inner_dest_rti=%d)",
-                     outerRel,
-                     innerRel);
-                return;
-            }
-            else
-            {
-                sql = mock_deparse_join_sql(root,
-                                            joinrel,
-                                            outerrel,
-                                            innerrel,
-                                            jointype,
-                                            (extra != NULL) ? extra->restrictlist : NIL,
-                                            &supported);
-
-                if (supported)
-                    elog(LOG, "mock_table remote explain (join): EXPLAIN %s", sql);
-                else
-                    elog(LOG, "mock_table remote explain (join): deparse unsupported");
-
-                got_remote_cost = mock_remote_explain_sql(sql,
-                                                          &startup_cost,
-                                                          &total_cost,
-                                                          &plan_rows,
-                                                          &plan_width);
-            }
-        }
+        fqp_add_ranked_join_path_candidate(&join_path_candidates,
+                                           cand_path,
+                                           cand->source);
+        got_remote_cost = true;
     }
 
     if (got_remote_cost)
-        elog(LOG,
-             "mock_table remote parsed join cost used: startup=%.3f total=%.3f rows=%.0f width=%d",
-             startup_cost,
-             total_cost,
-             (double) plan_rows,
-             plan_width);
-
-    if (supported && got_remote_cost)
     {
-        movement_factor = mock_table_data_movement_factor();
-        data_movement_cost = (Cost) (movement_factor * (double) plan_rows * (double) plan_width);
-        total_cost += data_movement_cost;
+        fqp_preserve_top_join_path_candidates(joinrel,
+                                              join_path_candidates);
+        elog(LOG, "mock_table: added remote-remote custom join paths for joinrel");
     }
-
-    cpath->path.startup_cost = startup_cost;
-    cpath->path.total_cost = total_cost;
-    cpath->path.rows = plan_rows;
-    if (plan_width > 0)
-        cpath->path.pathtarget->width = plan_width;
-    cpath->flags = 0;
-    cpath->custom_private = fqp_make_custom_private_join(dest_rti, (extra != NULL) ? extra->restrictlist : NIL);
-
-    cpath->custom_paths = list_make2(outerrel->cheapest_total_path, innerrel->cheapest_total_path);
-    cpath->methods = &exchange_path_methods;
-
-    fqp_add_path_keep_interesting_dest(joinrel, (Path *) cpath);
-
-    elog(LOG, "mock_table: added remote-remote custom join path for joinrel");
-    if (supported && !got_remote_cost)
-        elog(LOG, "mock_table: remote EXPLAIN failed for join, using fallback cost");
+    else
+        elog(LOG, "mock_table: no remote join candidate produced a usable EXPLAIN result");
 }
 
 void _PG_init(void) {

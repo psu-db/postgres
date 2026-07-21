@@ -1,5 +1,5 @@
 MODULE_big = mock_table
-OBJS = mock_table.o deparse.o memo.o comms.o
+OBJS = mock_table.o deparse.o memo.o comms.o fqp_trace.o fqp_path_utils.o
 EXTENSION = mock_table
 DATA = mock_table--1.0.sql
 

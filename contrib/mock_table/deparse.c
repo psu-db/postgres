@@ -678,31 +678,3 @@ mock_deparse_base_sql_for_source(PlannerInfo *root,
 
 	return buf.data;
 }
-
-char *
-mock_deparse_join_sql(PlannerInfo *root,
-				  RelOptInfo *joinrel,
-				  RelOptInfo *outerrel,
-				  RelOptInfo *innerrel,
-				  JoinType jointype,
-				  List *restrictlist,
-				  bool *supported)
-{
-	return mock_deparse_join_sql_for_source(root,
-							 joinrel,
-							 outerrel,
-							 innerrel,
-							 jointype,
-							 restrictlist,
-							 NULL,
-							 supported);
-}
-
-char *
-mock_deparse_base_sql(PlannerInfo *root,
-					 RelOptInfo *rel,
-					 PathTarget *target,
-					 bool *supported)
-{
-	return mock_deparse_base_sql_for_source(root, rel, target, NULL, supported);
-}

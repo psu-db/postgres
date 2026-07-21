@@ -152,7 +152,7 @@ fqp_dest_rti_from_custom_private(List *custom_private)
     return intVal(n);
 }
 
-bool
+static bool
 fqp_path_dest_rti(Path *path, int *dest_rti)
 {
     CustomPath *cp;
@@ -205,7 +205,7 @@ fqp_best_path_for_source(PlannerInfo *root, RelOptInfo *rel, const char *source)
     return best_path;
 }
 
-void
+static void
 fqp_add_path_keep_interesting_dest(RelOptInfo *rel, Path *path)
 {
     /*
@@ -308,7 +308,7 @@ fqp_preserve_top_join_path_candidates(RelOptInfo *joinrel, List *candidates)
 #endif
 }
 
-int
+static int
 reloptinfo_dest_rti(PlannerInfo *root, RelOptInfo *rel)
 {
     if (rel == NULL)

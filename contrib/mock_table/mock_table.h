@@ -48,24 +48,11 @@ extern void mock_table_record_remote_explain(const char *target_source,
 									 Cardinality rows,
 									 int width);
 
-extern char *mock_deparse_base_sql(PlannerInfo *root,
-						 RelOptInfo *rel,
-						 PathTarget *target,
-						 bool *supported);
-
 extern char *mock_deparse_base_sql_for_source(PlannerInfo *root,
 							   RelOptInfo *rel,
 							   PathTarget *target,
 							   const char *dest_source,
 							   bool *supported);
-
-extern char *mock_deparse_join_sql(PlannerInfo *root,
-								 RelOptInfo *joinrel,
-								 RelOptInfo *outerrel,
-								 RelOptInfo *innerrel,
-								 JoinType jointype,
-								 List *restrictlist,
-								 bool *supported);
 
 extern char *mock_deparse_join_sql_for_source(PlannerInfo *root,
 									RelOptInfo *joinrel,
