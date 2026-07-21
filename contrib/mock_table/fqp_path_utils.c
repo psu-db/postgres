@@ -21,7 +21,7 @@
  * common case, while bounding the amount of state that can flow upward through
  * the DP. Set to 0 to preserve every FQP destination candidate.
  */
-#define FQP_JOIN_ANNOTATION_TOP_K 3
+#define FQP_JOIN_ANNOTATION_TOP_K 0
 
 typedef struct FqpJoinPathCandidate
 {
@@ -172,56 +172,6 @@ fqp_path_dest_rti(Path *path, int *dest_rti)
     return true;
 }
 
-Path *
-fqp_best_path_for_source(PlannerInfo *root, RelOptInfo *rel, const char *source)
-{
-    ListCell   *lc;
-    Path       *best_path;
-    int         path_dest_rti;
-    char        path_source[64];
-
-    if (root == NULL || rel == NULL || source == NULL || source[0] == '\0')
-        return NULL;
-
-    best_path = NULL;
-    foreach(lc, rel->pathlist)
-    {
-        Path *path = (Path *) lfirst(lc);
-
-        if (!fqp_path_dest_rti(path, &path_dest_rti))
-            continue;
-
-        path_source[0] = '\0';
-        if (!fqp_get_source_for_rti(root, (Index) path_dest_rti, path_source, sizeof(path_source)))
-            continue;
-
-        if (strcmp(path_source, source) != 0)
-            continue;
-
-        if (best_path == NULL || compare_path_costs(path, best_path, TOTAL_COST) < 0)
-            best_path = path;
-    }
-
-    return best_path;
-}
-
-static void
-fqp_add_path_keep_interesting_dest(RelOptInfo *rel, Path *path)
-{
-    /*
-     * PostgreSQL does not know that FQP destination/source is a physical
-     * property. A path that is dominated on local cost can still be the only
-     * path at a useful remote destination for an upper join.
-     *
-     * Do not call add_path() here: when it rejects a path it also frees it.
-     * Keep these paths explicitly and let set_cheapest() choose the cheapest
-     * path later while upper FQP joins can still inspect all destinations.
-     */
-    rel->pathlist = lappend(rel->pathlist, path);
-    elog(LOG,
-         "mock_table: preserved FQP destination path for upper joins");
-}
-
 void
 fqp_add_ranked_join_path_candidate(List **candidates,
                                    CustomPath *path,
@@ -286,15 +236,16 @@ fqp_preserve_top_join_path_candidates(RelOptInfo *joinrel, List *candidates)
 #if FQP_JOIN_ANNOTATION_TOP_K > 0
         if (kept >= FQP_JOIN_ANNOTATION_TOP_K)
         {
-            elog(LOG,
-                 "mock_table: top-k join annotation pruning dropped destination source=%s total=%.3f",
-                 candidate->source,
-                 candidate->path->path.total_cost);
-            continue;
+            // elog(LOG,
+            //      "mock_table: top-k join annotation pruning dropped destination source=%s total=%.3f",
+            //      candidate->source,
+            //      candidate->path->path.total_cost);
+            // continue;
+            break;
         }
 #endif
 
-        fqp_add_path_keep_interesting_dest(joinrel, (Path *) candidate->path);
+		joinrel->pathlist = lappend(joinrel->pathlist, candidate->path);
         kept++;
     }
 
@@ -334,56 +285,6 @@ reloptinfo_dest_rti(PlannerInfo *root, RelOptInfo *rel)
     }
 
     return 0;
-}
-
-bool
-fqp_rel_has_sink_local_path(PlannerInfo *root, RelOptInfo *rel)
-{
-    ListCell   *lc;
-
-    if (root == NULL || rel == NULL)
-        return false;
-
-    if (IS_SIMPLE_REL(rel))
-    {
-        RangeTblEntry *rte;
-        char source[64];
-
-        rte = fqp_rt_fetch(root, rel->relid);
-        if (rte == NULL || rte->rtekind != RTE_RELATION)
-            return false;
-
-        if (!is_remote_table(rte->relid))
-            return true;
-
-        source[0] = '\0';
-        if (fqp_get_source_for_rte(rte, source, sizeof(source)) &&
-            fqp_is_local_candidate_source(source))
-            return true;
-
-        return false;
-    }
-
-    foreach(lc, rel->pathlist)
-    {
-        Path *path = (Path *) lfirst(lc);
-        int   dest_rti;
-        char  source[64];
-
-        /*
-         * Non-FQP paths are ordinary PostgreSQL paths and therefore execute
-         * locally in this optimizer instance.
-         */
-        if (!fqp_path_dest_rti(path, &dest_rti))
-            return true;
-
-        source[0] = '\0';
-        if (fqp_get_source_for_rti(root, (Index) dest_rti, source, sizeof(source)) &&
-            fqp_is_local_candidate_source(source))
-            return true;
-    }
-
-    return false;
 }
 
 static void
@@ -430,10 +331,18 @@ fqp_collect_source_candidates_from_rel(PlannerInfo *root,
 
     if (IS_SIMPLE_REL(rel))
     {
+        int dest_rti = reloptinfo_dest_rti(root, rel);
+
+        if (dest_rti <= 0)
+        {
+            *has_local_candidate = true;
+            return;
+        }
+
         fqp_add_source_candidate_for_rti(root,
                                          sources,
                                          has_local_candidate,
-                                         reloptinfo_dest_rti(root, rel));
+                                         dest_rti);
         return;
     }
 
@@ -443,7 +352,10 @@ fqp_collect_source_candidates_from_rel(PlannerInfo *root,
         int   dest_rti;
 
         if (!fqp_path_dest_rti(path, &dest_rti))
+        {
+            *has_local_candidate = true;
             continue;
+        }
 
         fqp_add_source_candidate_for_rti(root,
                                          sources,

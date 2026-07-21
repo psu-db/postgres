@@ -52,8 +52,7 @@ static PlannedStmt *fqp_planner_hook(Query *parse,
                                      int cursorOptions,
                                      ParamListInfo boundParams);
 
-static PlannedStmt *
-fqp_planner_hook(Query *parse,
+static PlannedStmt *fqp_planner_hook(Query *parse,
                  const char *query_string,
                  int cursorOptions,
                  ParamListInfo boundParams)
@@ -131,9 +130,7 @@ static void rescan_exchange_scan(CustomScanState *node) {
         ExecReScan((PlanState *) lfirst(lc));
 }
 
-
-static void
-explain_exchange_scan(CustomScanState *node, List *ancestors, ExplainState *es)
+static void explain_exchange_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 {
     CustomScan  *cscan;
     const char  *scan_kind;
@@ -537,24 +534,6 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
         return;
     }
 
-#if FQP_LOCAL_ABSORBING_JOIN_PRUNING
-    /*
-     * FQP LOCAL-ABSORBING PRUNING:
-     *
-     * This partitions distributed optimization by final sink. If either child
-     * side is already available locally at this sink, keep this join local and
-     * skip remote EXPLAINs for alternate destinations. Disable by setting
-     * FQP_LOCAL_ABSORBING_JOIN_PRUNING to 0 above.
-     */
-    if (fqp_rel_has_sink_local_path(root, outerrel) ||
-        fqp_rel_has_sink_local_path(root, innerrel))
-    {
-        elog(LOG,
-             "mock_table: local-absorbing pruning kept joinrel local; skipping remote join EXPLAIN candidates");
-        return;
-    }
-#endif
-
     got_remote_cost = false;
     sources = NIL;
     join_path_candidates = NIL;
@@ -567,6 +546,23 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
                                            innerrel,
                                            &sources,
                                            &has_local_candidate);
+
+#if FQP_LOCAL_ABSORBING_JOIN_PRUNING
+    /*
+     * FQP LOCAL-ABSORBING PRUNING:
+     *
+     * This partitions distributed optimization by final sink. If either child
+     * side is already available locally at this sink, keep this join local and
+     * skip remote EXPLAINs for alternate destinations. Disable by setting
+     * FQP_LOCAL_ABSORBING_JOIN_PRUNING to 0 above.
+     */
+    if (has_local_candidate)
+    {
+        elog(LOG,
+             "mock_table: local-absorbing pruning kept joinrel local; skipping remote join EXPLAIN candidates");
+        return;
+    }
+#endif
 
     if (sources == NIL)
     {
@@ -586,8 +582,6 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
         bool cand_supported;
         bool cand_got_remote_cost;
         char *sql;
-        Path *outer_path;
-        Path *inner_path;
 
         cand_startup = DBL_MAX;
         cand_total = DBL_MAX;
@@ -642,13 +636,7 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
             cand_path->path.pathtarget->width = cand_width;
         cand_path->flags = 0;
         cand_path->custom_private = fqp_make_custom_private_join(cand->rti, (extra != NULL) ? extra->restrictlist : NIL);
-        outer_path = fqp_best_path_for_source(root, outerrel, cand->source);
-        inner_path = fqp_best_path_for_source(root, innerrel, cand->source);
-        if (outer_path == NULL)
-            outer_path = outerrel->cheapest_total_path;
-        if (inner_path == NULL)
-            inner_path = innerrel->cheapest_total_path;
-        cand_path->custom_paths = list_make2(outer_path, inner_path);
+        cand_path->custom_paths = list_make2(outerrel->cheapest_total_path, innerrel->cheapest_total_path);
         cand_path->methods = &exchange_path_methods;
 
         fqp_add_ranked_join_path_candidate(&join_path_candidates,
@@ -670,19 +658,19 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
 void _PG_init(void) {
     mock_table_define_comms_gucs();
 
-    prev_get_rel_info_hook = get_relation_info_hook;
+    // prev_get_rel_info_hook = get_relation_info_hook;
     prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
     prev_set_join_pathlist_hook = set_join_pathlist_hook;
     prev_planner_hook = planner_hook;
 
-    get_relation_info_hook = fqp_get_relation_info_hook; // hook to mimic remote table stats
+    // get_relation_info_hook = fqp_get_relation_info_hook; // hook to mimic remote table stats
     set_rel_pathlist_hook = fqp_set_rel_pathlist_hook; // hook for custom baserel scans
     set_join_pathlist_hook = fqp_set_join_pathlist_hook; // hook for custom join paths
     planner_hook = fqp_planner_hook; // per-root-query local remote EXPLAIN trace
 }
 
 void _PG_fini(void) {
-    get_relation_info_hook = prev_get_rel_info_hook;
+    // get_relation_info_hook = prev_get_rel_info_hook;
     set_rel_pathlist_hook = prev_set_rel_pathlist_hook;
     set_join_pathlist_hook = prev_set_join_pathlist_hook;
     planner_hook = prev_planner_hook;
