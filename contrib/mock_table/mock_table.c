@@ -658,12 +658,12 @@ fqp_set_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *o
 void _PG_init(void) {
     mock_table_define_comms_gucs();
 
-    // prev_get_rel_info_hook = get_relation_info_hook;
+    prev_get_rel_info_hook = get_relation_info_hook;
     prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
     prev_set_join_pathlist_hook = set_join_pathlist_hook;
     prev_planner_hook = planner_hook;
 
-    // get_relation_info_hook = fqp_get_relation_info_hook; // hook to mimic remote table stats
+    get_relation_info_hook = fqp_get_relation_info_hook; // hook to mimic remote table stats
     set_rel_pathlist_hook = fqp_set_rel_pathlist_hook; // hook for custom baserel scans
     set_join_pathlist_hook = fqp_set_join_pathlist_hook; // hook for custom join paths
     planner_hook = fqp_planner_hook; // per-root-query local remote EXPLAIN trace
