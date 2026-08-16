@@ -4,7 +4,7 @@ EXTENSION = mock_table
 DATA = mock_table--1.0.sql
 
 PG_CONFIG = pg_config
-PG_CPPFLAGS = -g -O0
+PG_CPPFLAGS = -g -O2
 SHLIB_LINK += -lcurl
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
