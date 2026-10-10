@@ -8,6 +8,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -279,6 +280,130 @@ mock_deparse_op_expr(StringInfo buf, PlannerInfo *root, OpExpr *expr,
 	appendStringInfoChar(buf, ')');
 }
 
+/*
+ * PostgreSQL normally represents an IN list as a ScalarArrayOpExpr, and may
+ * fold its ArrayExpr argument into a single array Const before the planner
+ * hooks see it.  Emit the expression as individual comparisons so that its
+ * SQL shape agrees with the OR/AND form used when collecting cardinalities.
+ */
+static void
+mock_deparse_scalar_array_item(StringInfo buf, PlannerInfo *root,
+							   Node *scalar, Oid opno, Node *element,
+							   bool *supported)
+{
+	appendStringInfoChar(buf, '(');
+	mock_deparse_expr(buf, root, scalar, supported);
+	appendStringInfoChar(buf, ' ');
+	mock_append_operator_name(buf, opno, supported);
+	appendStringInfoChar(buf, ' ');
+	mock_deparse_expr(buf, root, element, supported);
+	appendStringInfoChar(buf, ')');
+}
+
+static void
+mock_deparse_scalar_array_op_expr(StringInfo buf, PlannerInfo *root,
+								 ScalarArrayOpExpr *expr,
+								 bool *supported)
+{
+	Node	   *scalar;
+	Node	   *array;
+	const char *separator = expr->useOr ? " OR " : " AND ";
+	bool		first = true;
+
+	if (list_length(expr->args) != 2)
+	{
+		*supported = false;
+		return;
+	}
+
+	scalar = (Node *) linitial(expr->args);
+	array = (Node *) lsecond(expr->args);
+	while (IsA(array, RelabelType))
+		array = (Node *) ((RelabelType *) array)->arg;
+
+	appendStringInfoChar(buf, '(');
+
+	if (IsA(array, ArrayExpr))
+	{
+		ArrayExpr  *array_expr = (ArrayExpr *) array;
+		ListCell   *lc;
+
+		if (array_expr->multidims)
+			*supported = false;
+
+		foreach(lc, array_expr->elements)
+		{
+			if (!first)
+				appendStringInfoString(buf, separator);
+			mock_deparse_scalar_array_item(buf, root, scalar, expr->opno,
+									   (Node *) lfirst(lc), supported);
+			first = false;
+		}
+	}
+	else if (IsA(array, Const))
+	{
+		Const	   *array_const = (Const *) array;
+
+		if (array_const->constisnull)
+		{
+			appendStringInfoString(buf, "NULL");
+			first = false;
+		}
+		else
+		{
+			ArrayType  *array_value;
+			Oid			element_type;
+			int16		element_len;
+			bool		element_byval;
+			char		element_align;
+			Datum	   *elements;
+			bool	   *nulls;
+			int			element_count;
+			int			i;
+
+			array_value = DatumGetArrayTypePCopy(array_const->constvalue);
+			element_type = ARR_ELEMTYPE(array_value);
+			get_typlenbyvalalign(element_type, &element_len,
+								 &element_byval, &element_align);
+			deconstruct_array(array_value, element_type, element_len,
+							  element_byval, element_align,
+							  &elements, &nulls, &element_count);
+
+			for (i = 0; i < element_count; i++)
+			{
+				Const		element_const;
+
+				MemSet(&element_const, 0, sizeof(element_const));
+				NodeSetTag(&element_const, T_Const);
+				element_const.consttype = element_type;
+				element_const.consttypmod = -1;
+				element_const.constcollid = array_const->constcollid;
+				element_const.constlen = element_len;
+				element_const.constvalue = elements[i];
+				element_const.constisnull = nulls[i];
+				element_const.constbyval = element_byval;
+
+				if (!first)
+					appendStringInfoString(buf, separator);
+				mock_deparse_scalar_array_item(buf, root, scalar, expr->opno,
+									   (Node *) &element_const, supported);
+				first = false;
+			}
+
+			pfree(elements);
+			pfree(nulls);
+			pfree(array_value);
+		}
+	}
+	else
+		*supported = false;
+
+	if (first && *supported)
+		appendStringInfoString(buf, expr->useOr ? "FALSE" : "TRUE");
+
+	appendStringInfoChar(buf, ')');
+}
+
 static void
 mock_deparse_null_test(StringInfo buf, PlannerInfo *root, NullTest *expr,
 					   bool *supported)
@@ -313,6 +438,11 @@ mock_deparse_expr(StringInfo buf, PlannerInfo *root, Node *node, bool *supported
 			break;
 		case T_OpExpr:
 			mock_deparse_op_expr(buf, root, (OpExpr *) node, supported);
+			break;
+		case T_ScalarArrayOpExpr:
+			mock_deparse_scalar_array_op_expr(buf, root,
+									  (ScalarArrayOpExpr *) node,
+									  supported);
 			break;
 		case T_BoolExpr:
 			mock_deparse_bool_expr(buf, root, (BoolExpr *) node, supported);
